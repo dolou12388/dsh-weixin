@@ -23,6 +23,8 @@ DeepSeek Harness 微信通道插件。移植自 `@tencent-weixin/openclaw-weixin
 | 媒体入站（图片/语音/文件/视频） | 完成，落盘后把路径交给 Agent |
 | 媒体出站（Agent 产出文件回传） | 完成，从 `tool/call` 提取写文件路径 |
 | 发送频控保护 | 完成，500ms 间隔 + 4 次退避重试 + 收尾补发 |
+| 思考过程开关（`replyThinking`） | 完成，默认关闭；整段与流式两条出口都按 `type` 分流 |
+| 「正在输入」状态 | 完成，心跳 + 收尾主动发 `status: 2` 撤销 |
 
 ### 实现中遇到的硬坑
 
@@ -318,7 +320,9 @@ L1 协议     getUpdates / sendMessage / CDN / AES / 长轮询退避
 
 ## 已知限制
 
-- 依赖 DSH `0.2.0-rc.2`。跨 rc 版本 API 可能变动，`compat.js` 会在加载时校验。
+- 需要 DSH **≥ `0.2.0-rc.2`**。`compat.js` 在加载时比对版本：低于此版本直接抛错，
+  高于则打 warn 放行（rc 阶段 API 向后兼容的面通常比向前兼容大）。确需跨版本试跑可设
+  `DSH_WEIXIN_ALLOW_ANY_VERSION=1` 跳过校验。
 - 仅支持单聊（DM），不支持群聊。
 - 语音消息只保存 SILK 原始文件，未做 WAV 转码，Agent 拿到的是二进制。
 - 出站文件依赖 Agent 主动调用写文件工具（`write`/`edit` 等）。只在正文里说“已生成”而没有

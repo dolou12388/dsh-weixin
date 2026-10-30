@@ -1,0 +1,23 @@
+# 仓库内一律存 LF。
+# 本机 git config core.autocrlf=true，工作区是 CRLF；不加这条的话，
+# 不同平台 clone 出来的换行不一致，diff 会整篇变红。
+* text=auto eol=lf
+
+# 明确二进制，避免被当文本转换污染
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.zip binary
+*.tgz binary
+*.zstd binary
+
+# 锁文件/GitHub 配置保持 LF
+package-lock.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.sh text eol=lf
