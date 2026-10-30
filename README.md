@@ -79,13 +79,13 @@ DeepSeek Harness 微信通道插件。移植自 `@tencent-weixin/openclaw-weixin
 
 ```sh
 # 简写形式（GitHub 用户名/仓库名）
-dsh plugin --profile web add <owner>/dsh-weixin
+dsh plugin --profile web add dolou12388/dsh-weixin
 
 # 完整 URL
-dsh plugin --profile web add git+https://github.com/<owner>/dsh-weixin.git
+dsh plugin --profile web add git+https://github.com/dolou12388/dsh-weixin.git
 
 # 指定 tag 或分支
-dsh plugin --profile web add git+https://github.com/<owner>/dsh-weixin.git#v0.1.0
+dsh plugin --profile web add git+https://github.com/dolou12388/dsh-weixin.git#v0.1.0
 ```
 
 安装器会 clone 仓库、装依赖、并**自动把 `dsh-weixin` 追加到
@@ -100,7 +100,7 @@ dsh plugin --profile web add git+https://github.com/<owner>/dsh-weixin.git#v0.1.
 
 ```sh
 dsh plugin --profile web remove dsh-weixin
-dsh plugin --profile web add <owner>/dsh-weixin
+dsh plugin --profile web add dolou12388/dsh-weixin
 ```
 
 ### 方式二：本地路径链接（推荐给开发者）

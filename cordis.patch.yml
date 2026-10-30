@@ -23,6 +23,12 @@
         typingIndicator: true
         # 是否发送工具调用进度提示
         replyProgressMessages: true
+        # 是否把模型的思考过程（reasoning 块）一并发出。默认关闭。
+        replyThinking: false
+        # 全局设定（系统提示注入）；留空表示不注入
+        globalPrompt: ''
+        # 按账号覆盖的全局设定：{ accountId: '文本' }
+        globalPromptByAccount: {}
         # 允许发消息的微信用户白名单；留空表示不限制（仅单聊）
         allowFrom: []
         # 会话映射
