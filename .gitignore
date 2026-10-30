@@ -7,20 +7,26 @@ node_modules/
 dist/
 build/
 
-# 本地产物与临时目录
-.tmp-verify/
+# 临时目录与日志
 .tmp/
+.tmp-*/
 *.log
 npm-debug.log*
 pnpm-debug.log*
 
-# 运行时产物（调试时生成的文件、测试输出）
-test.md
-message.txt
-hello.txt
-deliver-test.txt
-debug-inbound.jsonl
+# 本地调试产物
+# 抓包与会话日志导出
+*.jsonl
 *.jsonl.zstd
+# 协议调试输出
+debug-*.json
+debug-*.txt
+# 测试「发文件」功能时在仓库根生成的样例文件
+# （限定根目录，避免误伤子目录里的同名文件）
+/test.md
+/message.txt
+/hello.txt
+/deliver-test.txt
 
 # WorkBuddy 项目数据（含开发记录、可能含内部信息）
 .workbuddy/
