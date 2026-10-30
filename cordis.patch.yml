@@ -1,0 +1,37 @@
+# dsh-weixin 通道插件挂载片段。
+#
+# 安装方式：
+#   dsh plugin --profile web add dsh-weixin
+# 并在 profile 的 package.json 中把 dsh-weixin 加入 dsh.profile.bundles。
+#
+# 语法要点（已实测）：
+#   - 新增条目必须用 `insert:` 包裹；裸 `- name:` 会报 "id is required"。
+#   - 带 `- id:` 的顶层条目是"断言并修改已存在行"，用于覆盖配置。
+#   - config 会整体替换该行，不与代码内默认值合并，故此处列出需要覆盖的项。
+- insert:
+    - id: dsh-weixin
+      name: 'dsh-weixin'
+      config:
+        enabled: true
+        # 出站策略：final（整段发送，默认）| stream（增量发送）
+        outbound:
+          mode: final
+          minChars: 200
+          idleMs: 3000
+          textChunkLimit: 4000
+        # 是否发送"正在输入"状态
+        typingIndicator: true
+        # 是否发送工具调用进度提示
+        replyProgressMessages: true
+        # 允许发消息的微信用户白名单；留空表示不限制（仅单聊）
+        allowFrom: []
+        # 会话映射
+        session:
+          mode: single
+          cwd: ''
+          idPrefix: weixin
+        # 通道级配置
+        channel:
+          routeTag: ''
+          botAgent: 'dsh-weixin/0.1.0'
+          accounts: {}

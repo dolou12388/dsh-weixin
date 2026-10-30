@@ -1,0 +1,46 @@
+# 依赖
+node_modules/
+.pnpm-store/
+
+# 构建/打包产物
+*.tgz
+dist/
+build/
+
+# 本地产物与临时目录
+.tmp-verify/
+.tmp/
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# 运行时产物（调试时生成的文件、测试输出）
+test.md
+message.txt
+hello.txt
+deliver-test.txt
+debug-inbound.jsonl
+*.jsonl.zstd
+
+# WorkBuddy 项目数据（含开发记录、可能含内部信息）
+.workbuddy/
+
+# 编辑器与系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+
+# 环境变量与凭据
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.json
+
+# 本地配置覆盖
+cordis.patch.local.yml
+settings.local.json
