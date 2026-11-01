@@ -120,6 +120,10 @@ function generateClientId() {
  *
  * 优先在换行处切，其次在空格处，都找不到才硬切——避免把单词/句子拦腰截断。
  *
+ * 软边界（换行/空格）必须落在窗口的**后半段**才采用。早先只要找到换行就切，
+ * 于是 `"a\n" + 500 字无换行正文` 这种输入首段只有 1 个字符，一次回复被切成
+ * 七八个碎片气泡。现在低于 60% 位置的软边界一律放弃，退回窗口上限硬切。
+ *
  * @param {string} text - 原始文本
  * @param {number} limit - 单段上限
  * @returns {string[]} 分段列表
@@ -128,16 +132,20 @@ export function chunkText(text, limit) {
   const max = Math.max(1, Math.min(limit || WECHAT_TEXT_LIMIT, WECHAT_TEXT_LIMIT));
   if (text.length <= max) return [text];
 
+  /** 软边界可接受的最小位置：低于此值说明切口太靠前，宁可硬切。 */
+  const minCut = Math.floor(max * 0.6);
+
   const parts = [];
   let rest = text;
   while (rest.length > max) {
     const window = rest.slice(0, max);
-    // 优先换行，其次空格；位置太靠前（<60%）则放弃，直接硬切
+    // 优先换行，其次空格；两者都必须在后半段才采用
     let cut = window.lastIndexOf("\n");
-    if (cut < max * 0.6) {
+    if (cut < minCut) {
       const space = window.lastIndexOf(" ");
-      if (space >= max * 0.6) cut = space;
+      cut = space >= minCut ? space : -1;
     }
+    // 没有任何可接受的软边界 → 按窗口上限硬切
     if (cut <= 0) cut = max;
     parts.push(rest.slice(0, cut));
     rest = rest.slice(cut).replace(/^\s+/, "");
@@ -197,14 +205,31 @@ export class WeixinBridge {
     this.channel = channel;
     /** @type {Map<string, object>} sessionId → Agent 句柄 */
     this.agents = new Map();
+    /**
+     * @type {Map<string, Promise<object>>} sessionId → 进行中的创建任务
+     *
+     * 同一会话并发到达的消息只应触发一次创建，否则会撞
+     * `SessionAlreadyExistsError` 或互相踢掉对方的句柄。
+     */
+    this.agentCreations = new Map();
     /** @type {Map<string, string>} sessionId → 最近一次回复的接收人 */
     this.replyTargets = new Map();
     /** @type {Map<string, object>} agentId → 正在刷新的 typing 定时器 */
     this.typingTimers = new Map();
     /** @type {Map<string, string>} `${accountId}|${userId}` → typing_ticket（短期有效） */
     this.typingTickets = new Map();
-    /** 上一次成功发送的时间戳，用于保证发送间隔。 */
+    /** 上一次成功发送的时间戳，用于统计与排障。 */
     this.lastSentAt = 0;
+    /**
+     * 下一个可用的发送时隙（epoch ms）。
+     *
+     * `respectSendGap()` 在串行链内把它往后推一个 `sendGapMs`，
+     * 从而把并发发送排成有间隔的队列——单纯读 `lastSentAt` 做不到，
+     * 因为「读 → 睡 → 发送 → 写」跨了 await，并发调用会读到同一个旧值。
+     */
+    this.nextSendAt = 0;
+    /** 发送时隙串行链：保证「计算 + 占位」原子。 */
+    this.sendSlotChain = Promise.resolve();
     /** @type {Map<string, Array<{text: string, label: string, at: number}>>} 发送失败的片段 */
     this.failedParts = new Map();
     /**
@@ -335,6 +360,35 @@ export class WeixinBridge {
       logger.warn(`bridge: agent ${sessionId} disappeared, recreating`);
     }
 
+    // **并发去重**：下面的创建流程要跨多个 `await`（读预设、create/resume），
+    // 同一会话连发两条消息时，两个调用会同时走到这里、都看到 Map 为空，
+    // 于是并发创建同一个 sessionId——第二个必然撞 `SessionAlreadyExistsError`，
+    // 或者在 resume 路径上把第一个刚建好的 agent 当"僵尸"踢掉。
+    // 用 in-flight 表把并发收敛到同一次创建，后来者直接等结果。
+    const inflight = this.agentCreations.get(sessionId);
+    if (inflight) {
+      logger.debug(`bridge: 复用进行中的 agent 创建 session=${sessionId}`);
+      return inflight;
+    }
+
+    const creation = this.createAgent(sessionId, accountId, fromUserId)
+      .finally(() => this.agentCreations.delete(sessionId));
+    this.agentCreations.set(sessionId, creation);
+    return creation;
+  }
+
+  /**
+   * 真正执行 Agent 创建/恢复的流程。
+   *
+   * 从 `ensureAgent` 拆出来的原因见那里的并发去重注释——
+   * 只有 `ensureAgent` 需要做去重，创建细节不必知道有去重这回事。
+   *
+   * @param {string} sessionId - 会话 ID
+   * @param {string} accountId - 账号 ID
+   * @param {string} fromUserId - 微信用户 ID
+   * @returns {Promise<object>} Agent 实例
+   */
+  async createAgent(sessionId, accountId, fromUserId) {
     const cwd = this.resolveCwd();
 
     const selection = this.resolveModelSelection();
@@ -358,11 +412,21 @@ export class WeixinBridge {
       // 否则 Agent 拿不到任何工具——它只会把工具调用当纯文本写出来（DSML），
       // 既不会真正执行，也不报错，极难发现。
       if (agentPreset) {
-        try {
-          await this.ctx.agentPresets.mount(agentCtx, agentPreset);
-        } catch (err) {
-          logger.error(`bridge: 挂载预设 ${agentPreset} 失败: ${String(err)}`);
-          if (err && err.stack) logger.debug(String(err.stack));
+        // 用 `ctx.get()` 而非 `ctx.agentPresets`：预设注册表只在 web profile 提供，
+        // 静态 inject 会让 headless / acp 下整个插件永久 pending。
+        const presetRegistry = this.ctx.get("agentPresets");
+        if (!presetRegistry?.mount) {
+          logger.warn(
+            `bridge: 预设注册表不可用，${agentPreset} 未挂载（当前 profile 无 agentPresets 服务）；`
+              + "该会话将没有工具可用",
+          );
+        } else {
+          try {
+            await presetRegistry.mount(agentCtx, agentPreset);
+          } catch (err) {
+            logger.error(`bridge: 挂载预设 ${agentPreset} 失败: ${String(err)}`);
+            if (err && err.stack) logger.debug(String(err.stack));
+          }
         }
       }
 
@@ -424,7 +488,7 @@ export class WeixinBridge {
     const configured = this.cfg.session?.agentPreset;
     if (typeof configured === "string" && configured.trim()) return configured.trim();
 
-    const registry = this.ctx.agentPresets;
+    const registry = this.ctx.get("agentPresets");
     if (!registry) return undefined;
 
     try {
@@ -508,7 +572,8 @@ export class WeixinBridge {
     if (typeof configured === "string" && configured.trim()) return configured.trim();
 
     try {
-      const first = this.ctx.workspaceRegistry?.list?.()[0];
+      // `workspaceRegistry` 只在 web profile 提供，故用 `ctx.get()` 可选读取。
+      const first = this.ctx.get("workspaceRegistry")?.list?.()[0];
       if (first?.path) return first.path;
     } catch (err) {
       logger.warn(`resolveCwd: workspaceRegistry.list failed: ${String(err)}`);
@@ -736,8 +801,14 @@ export class WeixinBridge {
       const detail = payload?.error instanceof Error
         ? `${payload.error.name}: ${payload.error.message}`
         : String(payload?.error);
+      // `turn` / `step` 并非所有错误都带（如流式阶段就崩的），
+      // 直接插值会打出 `turn=undefined step=undefined`，掩盖真正的错误来源。
+      const where = [
+        payload?.turn === undefined ? "" : `turn=${payload.turn}`,
+        payload?.step === undefined ? "" : `step=${payload.step}`,
+      ].filter(Boolean).join(" ");
       logger.error(
-        `bridge: agent error session=${sessionId} turn=${payload?.turn} step=${payload?.step}: ${detail}`,
+        `bridge: agent error session=${sessionId}${where ? ` ${where}` : ""}: ${detail}`,
       );
       if (payload?.error instanceof Error && payload.error.stack) {
         logger.debug(String(payload.error.stack));
@@ -750,6 +821,35 @@ export class WeixinBridge {
           logger.debug(`typing cancel after error failed: ${String(err)}`);
         });
       }
+    });
+
+    // Agent 被销毁（Web UI 删会话、外部 dispose、恢复时踢掉僵尸）时清理本桥接
+    // 持有的引用。不清理的话：
+    //   - `this.agents` 里的死句柄会一直存活，Map 只增不减；
+    //   - 该会话的 typing 定时器会继续每 4s 打一次接口，且服务端状态永不撤销
+    //     （用户侧看到"对方一直在输入"），`timer.unref()` 只能让进程退出时
+    //     不受阻，进程活着它就一直在跑。
+    agent.ctx.on("agent/disposed", () => {
+      // 只清理指向**这个** agent 的映射：同 ID 可能已被新实例接手，
+      // 拿 ID 盲删会把新句柄一起删掉。
+      const tracked = this.agents.get(sessionId);
+      if (tracked?.agent === agent || tracked === agent) {
+        this.agents.delete(sessionId);
+      }
+      this.agentCreations.delete(sessionId);
+      this.streamedSessions.delete(sessionId);
+      this.thinkingOpen.delete(sessionId);
+      this.streamStats.delete(sessionId);
+      this.failedParts.delete(sessionId);
+      this.runIds.delete(sessionId);
+
+      const target = this.replyTargets.get(sessionId);
+      if (target) {
+        this.stopTyping(target).catch((err) => {
+          logger.debug(`typing cancel after dispose failed: ${String(err)}`);
+        });
+      }
+      logger.debug(`bridge: agent disposed, bridge state released session=${sessionId}`);
     });
 
     logger.debug(`bridge: outbound listener attached session=${sessionId}`);
@@ -829,8 +929,10 @@ export class WeixinBridge {
 
     const still = [];
     for (const part of list) {
-      // 补发之间也要留间隔，否则会再次触发频控
-      await sleep(Math.max(this.cfg.outbound?.sendGapMs ?? DEFAULT_SEND_GAP_MS, 1_500));
+      // 补发必须走统一的时隙队列，不能自己固定 sleep：
+      // 它和正常发送是并发的（`flushOutbound` 收尾时两者可能同时进行），
+      // 各睡各的就会在同一时刻一起发出去，正好撞平台频控。
+      await this.respectSendGap();
       try {
         const fromUserId = this.replyTargets.get(sessionId);
         const account = fromUserId ? this.channel.getAccountForSender(fromUserId) : undefined;
@@ -947,13 +1049,48 @@ export class WeixinBridge {
   /**
    * 保证相邻两次发送至少间隔 `sendGapMs`。
    *
+   * **必须是"占位"语义，不能只读时间戳再睡**：原实现是
+   * 「读 lastSentAt → sleep(wait) → 发送 → 写 lastSentAt」的跨 await 序列，
+   * 两个会话并发时会在同一时刻读到同一个 lastSentAt、算出同一个 wait、
+   * 一起醒来一起发送，间隔保护直接失效——平台侧表现是 `ret=-2 prepare failed`
+   * 且**内容被丢弃**（实测 5 条并发全部落在 1ms 内）。
+   *
+   * 现在改为串行化「等时隙 → 重算时隙」：用一条 promise 链把并发调用排成队，
+   * 每次调用在链内独占，等到自己的时隙后才把下一时隙推出去。
+   *
+   * 两个细节都不能省：
+   *   - **醒后校时**：Node 的 `setTimeout` 在 Windows 上会提前 ~7ms 触发，
+   *     单次 sleep 可能"睡不够"，间隔被吃掉后仍会撞频控。
+   *   - **从真实唤醒时刻起算下一时隙**（而非固定 `slot + gap`）：
+   *     否则定时器误差会沿队列累积，长回复分段发送时整体越走越慢。
+   *
    * @returns {Promise<void>}
    */
   async respectSendGap() {
     const gap = this.cfg.outbound?.sendGapMs ?? DEFAULT_SEND_GAP_MS;
-    if (!(gap > 0) || !this.lastSentAt) return;
-    const wait = this.lastSentAt + gap - Date.now();
-    if (wait > 0) await sleep(wait);
+    if (!(gap > 0)) return;
+
+    // 排队：把自己挂在队尾，前一个释放后才继续
+    const prev = this.sendSlotChain;
+    let release;
+    this.sendSlotChain = new Promise((resolve) => {
+      release = resolve;
+    });
+    await prev;
+
+    try {
+      const target = Math.max(Date.now(), this.nextSendAt || 0);
+      let wait = target - Date.now();
+      while (wait > 0) {
+        await sleep(wait);
+        wait = target - Date.now();
+      }
+      this.nextSendAt = Date.now() + gap;
+    } finally {
+      // 必须在 finally 释放：sleep 期间插件可能被 dispose，
+      // 漏释放会让后续所有发送永久卡在 `await prev` 上。
+      release();
+    }
   }
 
   /**

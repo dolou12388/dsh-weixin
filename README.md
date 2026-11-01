@@ -285,6 +285,15 @@ L1 协议     getUpdates / sendMessage / CDN / AES / 长轮询退避
   只写相对段会被静默拒绝
 - `connection` 服务只在 web profile 存在，故用 `ctx.inject(["connection"], cb)` 可选注入，
   不能写进静态 `inject` 数组（否则其他 profile 永久 pending）
+- 同一道理适用于**任何单个 bundle 才提供的服务**。静态 `inject` 的语义是
+  「全部就绪才执行 `apply`」，缺一个就永久 pending，且**不报错**——表现为
+  「装了但没反应」，最难排查。已逐个核实各服务归属（`dsh-base` 为共同底座）：
+    - `agents` / `agentDefaultModel` / `systemPrompt` / `commands` → `dsh-base`，可进 `inject`
+    - `workspaceRegistry` / `agentPresets` / `connection` → 仅 `dsh-web-app`，**不可**进 `inject`
+  后三者一律用 `ctx.get(name)` 在运行期按需读取：该 API 不要求声明 inject，
+  服务缺失时返回 `undefined` 而非抛错（DSH 自己的 `dsh-commands` 也这么用）。
+- `schemastery` 用 `createRequire` 同步可选加载，缺包时退化到手写
+  `~standard.validate` 兜底，而不是顶层 `import` 直接崩（GitHub 安装版曾缺此包）
 - 改 `lib/client.js` **无需重启 Host**：bundle 的 rev 由文件 mtime/size 算出
 
 ## 源码地图
@@ -292,7 +301,7 @@ L1 协议     getUpdates / sendMessage / CDN / AES / 长轮询退避
 | 文件 | 职责 |
 |---|---|
 | `src/index.js` | 插件入口，声明 `name` / `inject` / `apply` |
-| `src/config.js` | 配置默认值与归一化 |
+| `src/config.js` | 配置默认值、`Config` schema（Schemastery，缺包时手写兜底）与归一化 |
 | `src/config-store.js` | UI 设置 overlay：读写、校验、就地热更新、恢复默认 |
 | `src/compat.js` | 宿主版本校验 |
 | `src/protocol/api.js` | iLink 协议：长轮询、发送、CDN、uint64 精度保护 |

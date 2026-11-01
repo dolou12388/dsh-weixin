@@ -45,20 +45,22 @@ function loadOverlaySafely() {
 /**
  * 注入的 DSH 服务。
  *
- * 对应 DSH `0.2.0-rc.2` 的 ctx 服务名。
- * cordis 要求：凡是要访问的服务都必须在此声明，否则访问时抛
- * `cannot get property "x" without inject`。
+ * 语义：`inject` 里的服务**全部就绪**才会执行 `apply`；缺一个就永久 pending，
+ * 插件看起来"装了但没反应"，且不报错。所以这里只放**所有 profile 都提供**的服务。
  *
- * 注意：`connection` 不在此列——它只存在于 web profile。用 `ctx.inject()` 可选等待。
+ * 各服务提供方（已逐个核实 `package.json` 依赖）：
+ *   - `agents` / `agentDefaultModel` / `systemPrompt` / `commands` → `dsh-base`，各 profile 都有。
+ *   - `workspaceRegistry` → 仅 `dsh-web-app`（`dsh-base` 不含 `dsh-workspace`）。
+ *   - `agentPresets` → 仅 `dsh-web-app`（`dsh-base` 不含 `dsh-agent-preset*`）。
+ *   - `connection` → 仅 `dsh-web-app`。
+ *
+ * 后三者一律**不进** `inject`，改用 `ctx.get(name)` 在运行期按需读取：
+ * 该 API 不要求声明 inject，服务缺失时返回 `undefined` 而非抛错。
  */
 export const inject = [
   "agents",
   "agentDefaultModel",
   "systemPrompt",
-  "workspaceRegistry",
-  "agentPresets",
-  "permissionPresets",
-  "sessionTitle",
   "commands",
 ];
 

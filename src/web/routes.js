@@ -346,6 +346,12 @@ export function registerWeixinRoutes(ctx, channel, cfg, baseCfg, hooks) {
       const qrcodeImage = await renderQrDataUrl(qrcodeUrl);
 
       // 后台等待扫码；结果写入 loginRuns，由 login/status 轮询取走。
+      //
+      // 结果必须挂成**显式字段**（`state.result` / `state.settled`），
+      // 不能让轮询端用 `Promise.race([run, Promise.resolve(null)])` 猜完成状态：
+      // `Promise.resolve(null)` 是已决议的微任务，会抢在 `run` 的 then 链之前
+      // 赢得 race，即使登录早就成功也会被判成"未完成"（已实测复现）。
+      const state = { settled: false, result: null, cancelled: false };
       const run = waitForWeixinLogin({
         sessionKey,
         timeoutMs: LOGIN_TIMEOUT_MS,
@@ -378,12 +384,20 @@ export function registerWeixinRoutes(ctx, channel, cfg, baseCfg, hooks) {
           logger.error(`web login failed: ${String(err)}`);
           return { ok: false, message: String(err) };
         })
+        .then((outcome) => {
+          // 已经被 `login/cancel` 取消的会话，不要用真实结果覆盖取消语义。
+          if (state.cancelled) return state.result;
+          // 先落结果再置位：轮询端看到 `settled` 时 `result` 必定已就绪。
+          state.result = outcome;
+          state.settled = true;
+          return outcome;
+        })
         .finally(() => {
           // 保留 60s 供前端取走结果，之后清理。
           setTimeout(() => loginRuns.delete(sessionKey), 60_000).unref?.();
         });
 
-      loginRuns.set(sessionKey, run);
+      loginRuns.set(sessionKey, { run, state });
 
       return json({ ok: true, sessionKey, qrcodeUrl, qrcodeImage });
     } catch (err) {
@@ -397,19 +411,19 @@ export function registerWeixinRoutes(ctx, channel, cfg, baseCfg, hooks) {
     if (!sessionKey) return json({ ok: false, error: "缺少 sessionKey" }, 400);
 
     const live = getLoginStatus(sessionKey);
-    const run = loginRuns.get(sessionKey);
+    const entry = loginRuns.get(sessionKey);
 
-    // 已结束：给出最终结果并清理
-    if (run) {
-      const settled = await Promise.race([run, Promise.resolve(null)]);
-      if (settled) {
-        loginRuns.delete(sessionKey);
-        qrCache.delete(sessionKey);
-        return json({ ok: true, done: true, result: settled });
-      }
+    // 已结束：给出最终结果并清理。
+    // 判据是 `state.settled` 而非 race —— 见 login/start 里的注释，
+    // race 会让已完成的任务被判成未完成，前端白轮询到超时。
+    if (entry?.state?.settled) {
+      const result = entry.state.result;
+      loginRuns.delete(sessionKey);
+      qrCache.delete(sessionKey);
+      return json({ ok: true, done: true, result });
     }
 
-    if (!live.alive && !run) {
+    if (!live.alive && !entry) {
       qrCache.delete(sessionKey);
       return json({ ok: true, done: true, result: { ok: false, message: live.message } });
     }
@@ -457,6 +471,14 @@ export function registerWeixinRoutes(ctx, channel, cfg, baseCfg, hooks) {
     const sessionKey = String(body.sessionKey ?? "");
     if (sessionKey) {
       cancelLogin(sessionKey);
+      // 标记取消：正在等待的 run 稍后仍会 resolve，若不加这个标记，
+      // 它的结果（多半是"登录未完成"）会覆盖用户主动取消的语义。
+      const entry = loginRuns.get(sessionKey);
+      if (entry?.state) {
+        entry.state.cancelled = true;
+        entry.state.settled = true;
+        entry.state.result = { ok: false, message: "已取消登录", cancelled: true };
+      }
       loginRuns.delete(sessionKey);
       qrCache.delete(sessionKey);
     }

@@ -1,14 +1,68 @@
 /**
- * 插件配置定义。
+ * 插件配置定义与归一化。
  *
- * DSH 的配置校验由 schemastery 完成。为避免在无 schemastery 环境下加载失败，
- * 这里提供一份纯 JS 的默认值与归一化逻辑，schema 在可用时另行挂载。
+ * 两条契约（DSH 硬规则 6）：
+ *   1. 导出的 `Config` 是 Schemastery schema，默认值写在 schema 里；
+ *      不要导出普通对象充当 Config —— Cordis 用 `Config["~standard"].validate()`
+ *      校验，普通对象没有该接口会被直接忽略，配置校验就形同虚设。
+ *   2. **默认值不得被下发的 cfg 修改**。历史实现里 `mergeConfig` 只做浅拷贝，
+ *      嵌套对象（`outbound` / `session` / `media` / `channel`）会与 `DEFAULT_CONFIG`
+ *      共享同一个引用；UI 热更新就地改 `cfg.outbound.mode` 时，被改的其实是
+ *      默认值本身，于是同一进程内后续任何一次 `normalizeConfig({})` 都会拿到
+ *      被污染的默认值，「恢复默认」也回不到出厂值。现在统一返回深拷贝。
+ *
+ * **关于 schemastery 的加载方式**：它被声明为 `dependencies`，正常安装一定有；
+ * 但本插件曾被从 GitHub 直接安装过，而某些 profile 的 pnpm 解析会漏装它，
+ * 表现为 `ERR_MODULE_NOT_FOUND`——插件连模块都进不去，比配置不校验严重得多。
+ * 因此改为**同步 require（可选）+ 手写 `~standard` 兜底**：
+ *   - 有 schemastery：用它，得到完整的类型/范围校验；
+ *   - 没有：退化为手写校验器，仍能在加载期拒绝非法枚举值，只是范围检查变弱。
+ * 用 `createRequire` 而非顶层 `import`，就是为了让缺包变成"降级"而不是"崩溃"。
  */
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
 
 /**
- * 默认配置。
+ * 尝试加载 schemastery。
  *
- * 字段语义与上游 `config/config-schema.js` 对齐，额外增加 DSH 专属的出站与会话选项。
+ * @returns {object|null} Schema 构造器；不可用时返回 null
+ */
+function loadSchema() {
+  try {
+    const mod = require("@deepseek-ai/schemastery");
+    const Schema = mod?.default ?? mod;
+    return typeof Schema?.object === "function" ? Schema : null;
+  } catch {
+    return null;
+  }
+}
+
+const Schema = loadSchema();
+
+/**
+ * 单个微信文本项的上限。服务端在 4000 字符处硬截断，超过会被切掉。
+ */
+const WECHAT_TEXT_LIMIT = 4000;
+
+/** 单条配置文本（全局设定）的字节上限。 */
+const GLOBAL_PROMPT_MAX_BYTES = 64 * 1024;
+
+/**
+ * 出站模式的合法取值。
+ */
+export const OUTBOUND_MODES = ["final", "stream"];
+
+/**
+ * 会话模式的合法取值。
+ */
+export const SESSION_MODES = ["single", "per-message"];
+
+/**
+ * 默认配置（出厂值）。
+ *
+ * 只用于文档与归一化兜底；**不要**把它当作可变对象使用。
+ * `normalizeConfig` 会深拷贝后再交给调用方。
  */
 export const DEFAULT_CONFIG = {
   /** 是否启用通道。 */
@@ -21,7 +75,7 @@ export const DEFAULT_CONFIG = {
     /** stream 模式下的空闲合并窗口（毫秒）。 */
     idleMs: 3000,
     /** 单条消息最大字符数。 */
-    textChunkLimit: 4000,
+    textChunkLimit: WECHAT_TEXT_LIMIT,
     /**
      * 相邻出站消息最小间隔（毫秒）。
      *
@@ -94,84 +148,301 @@ export const DEFAULT_CONFIG = {
 };
 
 /**
+ * 构造配置 schema。
+ *
+ * 默认值全部取自 `DEFAULT_CONFIG`，二者不会漂移。
+ *
+ * @returns {object} Schemastery schema
+ */
+function buildSchemasteryConfig() {
+  return Schema.object({
+    enabled: Schema.boolean().default(DEFAULT_CONFIG.enabled),
+    outbound: Schema.object({
+      mode: Schema.union(OUTBOUND_MODES).default(DEFAULT_CONFIG.outbound.mode),
+      minChars: Schema.natural()
+        .min(1)
+        .max(20000)
+        .default(DEFAULT_CONFIG.outbound.minChars),
+      idleMs: Schema.natural()
+        .min(100)
+        .max(60000)
+        .default(DEFAULT_CONFIG.outbound.idleMs),
+      textChunkLimit: Schema.natural()
+        .min(200)
+        .max(WECHAT_TEXT_LIMIT)
+        .default(DEFAULT_CONFIG.outbound.textChunkLimit),
+      sendGapMs: Schema.natural()
+        .max(10000)
+        .default(DEFAULT_CONFIG.outbound.sendGapMs),
+    }).default(DEFAULT_CONFIG.outbound),
+    replyProgressMessages: Schema.boolean().default(DEFAULT_CONFIG.replyProgressMessages),
+    replyThinking: Schema.boolean().default(DEFAULT_CONFIG.replyThinking),
+    typingIndicator: Schema.boolean().default(DEFAULT_CONFIG.typingIndicator),
+    toolDeny: Schema.array(Schema.string()).default(DEFAULT_CONFIG.toolDeny),
+    allowFrom: Schema.array(Schema.string()).default(DEFAULT_CONFIG.allowFrom),
+    session: Schema.object({
+      mode: Schema.union(SESSION_MODES).default(DEFAULT_CONFIG.session.mode),
+      cwd: Schema.string().default(DEFAULT_CONFIG.session.cwd),
+      idPrefix: Schema.string().default(DEFAULT_CONFIG.session.idPrefix),
+      agentPreset: Schema.string().default(DEFAULT_CONFIG.session.agentPreset),
+    }).default(DEFAULT_CONFIG.session),
+    channel: Schema.object({
+      routeTag: Schema.union([Schema.string(), Schema.number()]).default(
+        DEFAULT_CONFIG.channel.routeTag,
+      ),
+      botAgent: Schema.string().default(DEFAULT_CONFIG.channel.botAgent),
+      accounts: Schema.dict(Schema.any()).default(DEFAULT_CONFIG.channel.accounts),
+    }).default(DEFAULT_CONFIG.channel),
+    globalPrompt: Schema.string()
+      // 全局设定会整段注入系统提示，超长会挤掉真正的上下文。
+      // Schemastery 的 min/max 按字符串长度算，中文一字一码点，
+      // 故按 3 字节/字的保守估算折半，宁严勿松。
+      .max(Math.floor(GLOBAL_PROMPT_MAX_BYTES / 3))
+      .default(DEFAULT_CONFIG.globalPrompt),
+    globalPromptByAccount: Schema.dict(Schema.string()).default(
+      DEFAULT_CONFIG.globalPromptByAccount,
+    ),
+    media: Schema.object({
+      inbound: Schema.boolean().default(DEFAULT_CONFIG.media.inbound),
+      outbound: Schema.boolean().default(DEFAULT_CONFIG.media.outbound),
+      dir: Schema.string().default(DEFAULT_CONFIG.media.dir),
+    }).default(DEFAULT_CONFIG.media),
+  });
+}
+
+/**
+ * 手写校验器的产物形状，对齐 Standard Schema v1。
+ *
+ * Cordis 只调用 `Config["~standard"].validate(config)`，并要求它**同步**返回
+ * `{ value }` 或 `{ issues }`（见 `resolveConfig`：`if ("then" in result) throw`）。
+ * 只要满足这条契约，Cordis 并不关心它是不是 schemastery 造的。
+ *
+ * @param {object} input - 用户配置
+ * @returns {{value: object}|{issues: Array<{message: string, path?: Array<string|number>}>}}
+ *   校验结果
+ */
+function validateWithoutSchema(input) {
+  const issues = [];
+
+  if (input !== undefined && input !== null && typeof input !== "object") {
+    return { issues: [{ message: "config must be an object" }] };
+  }
+  const raw = input ?? {};
+
+  // 枚举值是最容易写错、后果又最隐蔽的一类（写错后行为静默降级），
+  // 缺 schemastery 时也要保住这条校验。
+  const mode = raw.outbound?.mode;
+  if (mode !== undefined && mode !== null && !OUTBOUND_MODES.includes(mode)) {
+    issues.push({
+      message: `expected one of ${OUTBOUND_MODES.join(" | ")}`,
+      path: ["outbound", "mode"],
+    });
+  }
+  const sessionMode = raw.session?.mode;
+  if (sessionMode !== undefined && sessionMode !== null && !SESSION_MODES.includes(sessionMode)) {
+    issues.push({
+      message: `expected one of ${SESSION_MODES.join(" | ")}`,
+      path: ["session", "mode"],
+    });
+  }
+
+  const globalPrompt = raw.globalPrompt;
+  if (typeof globalPrompt === "string"
+    && Buffer.byteLength(globalPrompt, "utf8") > GLOBAL_PROMPT_MAX_BYTES) {
+    issues.push({
+      message: `must be at most ${GLOBAL_PROMPT_MAX_BYTES} bytes`,
+      path: ["globalPrompt"],
+    });
+  }
+
+  if (issues.length > 0) return { issues };
+  // 与 schemastery 路径保持一致：返回补全默认值后的深拷贝。
+  return { value: normalizeConfig(raw) };
+}
+
+/**
+ * 插件配置 schema —— Cordis 加载插件时的校验入口。
+ *
+ * 非法取值（如 `outbound.mode: "x"`）会在**加载阶段**直接抛错，
+ * 而不是等到运行到一半才失败，符合"配置错误要响亮"。
+ *
+ * 未知字段会被保留但不报错，这样升级插件、回退旧配置都不会卡住启动。
+ *
+ * 有 schemastery 时返回真 schema；没有时返回手写 `~standard` 实现。
+ * 两条路径的契约完全一致，对 Cordis 透明。
+ */
+export const Config = Schema
+  ? buildSchemasteryConfig()
+  : {
+      "~standard": {
+        version: 1,
+        vendor: "dsh-weixin",
+        validate: validateWithoutSchema,
+      },
+    };
+
+/**
+ * 判断是否为可参与深合并的普通对象。
+ *
+ * 显式排除 null —— `typeof null === "object"`，不排除会让 `{ outbound: null }`
+ * 走进合并分支，随后在 `merged.outbound.mode` 处抛 TypeError。
+ *
+ * @param {unknown} value - 待判断值
+ * @returns {boolean} 是否为普通对象
+ */
+function isPlainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * 深拷贝一个配置值。
+ *
+ * 数组与普通对象逐层新建；其余（原始值、函数等）原样返回。
+ * 目的是切断与 `DEFAULT_CONFIG` 及调用方入参的引用共享。
+ *
+ * @param {unknown} value - 待拷贝值
+ * @returns {unknown} 拷贝结果
+ */
+export function cloneConfigValue(value) {
+  if (Array.isArray(value)) return value.map(cloneConfigValue);
+  if (isPlainObject(value)) {
+    const out = {};
+    for (const [key, item] of Object.entries(value)) {
+      out[key] = cloneConfigValue(item);
+    }
+    return out;
+  }
+  return value;
+}
+
+/**
  * 深合并配置。
  *
- * @param {object} base - 默认值
+ * `base` 不会被修改：所有嵌套对象都先深拷贝再合并，
+ * 因此调用方拿到的结果与 `base` 完全脱钩。
+ *
+ * @param {object} base - 默认值（不会被写入）
  * @param {object} override - 用户配置
- * @returns {object} 合并结果
+ * @returns {object} 合并结果（全新对象树）
  */
 export function mergeConfig(base, override) {
-  if (!override || typeof override !== "object") return { ...base };
+  const out = cloneConfigValue(base);
+  if (!isPlainObject(override)) return out;
 
-  const out = { ...base };
   for (const [key, value] of Object.entries(override)) {
     if (value === undefined) continue;
-    const prev = base[key];
-    if (
-      prev &&
-      typeof prev === "object" &&
-      !Array.isArray(prev) &&
-      value &&
-      typeof value === "object" &&
-      !Array.isArray(value)
-    ) {
+    const prev = out[key];
+    if (isPlainObject(prev) && isPlainObject(value)) {
       out[key] = mergeConfig(prev, value);
     } else {
-      out[key] = value;
+      // 显式传 null 视为"用默认值"，而不是把默认值覆盖成 null，
+      // 否则后续任何 `cfg.x.y` 访问都会抛 TypeError。
+      out[key] = value === null ? cloneConfigValue(base[key]) : cloneConfigValue(value);
     }
   }
   return out;
 }
 
 /**
- * 归一化用户配置，补齐默认值。
+ * 把任意输入夹成合法整数。
+ *
+ * @param {unknown} value - 原始值
+ * @param {number} fallback - 非法时回退值
+ * @param {number} min - 下界
+ * @param {number} max - 上界
+ * @returns {number} 合法整数
+ */
+function toBoundedInt(value, fallback, min, max) {
+  const n = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, Math.round(n)));
+}
+
+/**
+ * 归一化用户配置，补齐默认值并夹紧非法取值。
+ *
+ * 与 schema 的分工：schema 在**加载期**拒绝非法配置（响亮失败），
+ * 这里在**运行期**对 UI 热更新等旁路来源做宽容修正——
+ * 这些来源无法触发 schema 校验，只能在消费点兜底。
+ *
+ * 不修改入参，也不修改 `DEFAULT_CONFIG`。
  *
  * @param {object} [config] - 原始配置
- * @returns {object} 归一化后的配置
+ * @returns {object} 归一化后的全新配置对象
  */
 export function normalizeConfig(config) {
-  const merged = mergeConfig(DEFAULT_CONFIG, config ?? {});
+  const merged = mergeConfig(DEFAULT_CONFIG, config);
 
-  // 白名单去空去重
+  // 白名单去空去重。
+  // 必须先剔除 null/undefined 再 `String()`：直接 `String(null)` 会得到
+  // 字符串 `"null"`，于是白名单里凭空多出一个永不匹配的用户 ID，
+  // 而且它非空、不会被下面的 `filter(Boolean)` 拦掉（已实测复现）。
   merged.allowFrom = Array.isArray(merged.allowFrom)
-    ? [...new Set(merged.allowFrom.map((v) => String(v).trim()).filter(Boolean))]
+    ? [...new Set(
+        merged.allowFrom
+          .filter((v) => v !== null && v !== undefined)
+          .map((v) => String(v).trim())
+          .filter(Boolean),
+      )]
     : [];
 
-  // 出站模式兜底
+  // 工具黑名单同理：非字符串项会让 restrict() 整体抛错
+  merged.toolDeny = Array.isArray(merged.toolDeny)
+    ? [...new Set(
+        merged.toolDeny
+          .filter((v) => v !== null && v !== undefined)
+          .map((v) => String(v).trim())
+          .filter(Boolean),
+      )]
+    : [];
+
+  // 出站参数兜底
   if (merged.outbound.mode !== "stream") merged.outbound.mode = "final";
-  if (!Number.isFinite(merged.outbound.minChars) || merged.outbound.minChars <= 0) {
-    merged.outbound.minChars = DEFAULT_CONFIG.outbound.minChars;
-  }
-  if (!Number.isFinite(merged.outbound.idleMs) || merged.outbound.idleMs <= 0) {
-    merged.outbound.idleMs = DEFAULT_CONFIG.outbound.idleMs;
-  }
-  if (!Number.isFinite(merged.outbound.textChunkLimit) || merged.outbound.textChunkLimit <= 0) {
-    merged.outbound.textChunkLimit = DEFAULT_CONFIG.outbound.textChunkLimit;
-  }
+  merged.outbound.minChars = toBoundedInt(
+    merged.outbound.minChars,
+    DEFAULT_CONFIG.outbound.minChars,
+    1,
+    20000,
+  );
+  merged.outbound.idleMs = toBoundedInt(
+    merged.outbound.idleMs,
+    DEFAULT_CONFIG.outbound.idleMs,
+    100,
+    60000,
+  );
+  merged.outbound.textChunkLimit = toBoundedInt(
+    merged.outbound.textChunkLimit,
+    DEFAULT_CONFIG.outbound.textChunkLimit,
+    200,
+    WECHAT_TEXT_LIMIT,
+  );
+  merged.outbound.sendGapMs = toBoundedInt(
+    merged.outbound.sendGapMs,
+    DEFAULT_CONFIG.outbound.sendGapMs,
+    0,
+    10000,
+  );
 
   // 会话模式兜底
   if (merged.session.mode !== "per-message") merged.session.mode = "single";
   if (!merged.session.idPrefix) merged.session.idPrefix = "weixin";
+  if (typeof merged.session.cwd !== "string") merged.session.cwd = "";
+  if (typeof merged.session.agentPreset !== "string") merged.session.agentPreset = "";
 
   // 全局设定归一化：非字符串一律按空处理，避免把对象塞进系统提示
   merged.globalPrompt =
     typeof merged.globalPrompt === "string" ? merged.globalPrompt : "";
-  if (
-    !merged.globalPromptByAccount ||
-    typeof merged.globalPromptByAccount !== "object" ||
-    Array.isArray(merged.globalPromptByAccount)
-  ) {
+  if (!isPlainObject(merged.globalPromptByAccount)) {
     merged.globalPromptByAccount = {};
   }
 
   // 媒体开关兜底
-  if (!merged.media || typeof merged.media !== "object") {
-    merged.media = { ...DEFAULT_CONFIG.media };
-  } else {
-    merged.media.inbound = merged.media.inbound !== false;
-    merged.media.outbound = merged.media.outbound !== false;
-    if (typeof merged.media.dir !== "string") merged.media.dir = "";
-  }
+  merged.media.inbound = merged.media.inbound !== false;
+  merged.media.outbound = merged.media.outbound !== false;
+  if (typeof merged.media.dir !== "string") merged.media.dir = "";
+
+  // 通道配置兜底
+  if (!isPlainObject(merged.channel.accounts)) merged.channel.accounts = {};
 
   return merged;
 }
