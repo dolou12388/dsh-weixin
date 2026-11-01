@@ -85,7 +85,7 @@ dsh plugin --profile web add dolou12388/dsh-weixin
 dsh plugin --profile web add git+https://github.com/dolou12388/dsh-weixin.git
 
 # 固定版本（推荐生产使用，避免跟随 main 变动）
-dsh plugin --profile web add git+https://github.com/dolou12388/dsh-weixin.git#v0.1.0
+dsh plugin --profile web add git+https://github.com/dolou12388/dsh-weixin.git#v0.1.1
 ```
 
 仓库地址：<https://github.com/dolou12388/dsh-weixin>
@@ -234,7 +234,7 @@ UI 设置存放在 `$DSH_HOME/storages/dsh-weixin/settings.json`，
 | `session.cwd` | `""` | 是 | 会话工作目录，空=DSH 默认（改后需重启） |
 | `session.idPrefix` | `weixin` | — | 会话 ID 前缀，避免与 Web UI 冲突 |
 | `session.agentPreset` | `""` | — | Agent 预设 ID，空=用 DSH 默认预设。**留空时仍会自动取默认预设，否则 Agent 没有工具** |
-| `channel.botAgent` | `dsh-weixin/0.1.0` | — | 写入 `base_info.bot_agent` |
+| `channel.botAgent` | `dsh-weixin/0.1.1` | — | 写入 `base_info.bot_agent` |
 
 ## 数据位置
 

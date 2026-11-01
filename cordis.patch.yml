@@ -39,5 +39,5 @@
         # 通道级配置
         channel:
           routeTag: ''
-          botAgent: 'dsh-weixin/0.1.0'
+          botAgent: 'dsh-weixin/0.1.1'
           accounts: {}
