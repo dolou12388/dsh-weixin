@@ -172,11 +172,12 @@ function sleep(ms, signal) {
  * @param {object} params.account - 账号运行参数（含 accountId / baseUrl / token）
  * @param {AbortSignal} params.signal - 取消信号
  * @param {(event: {accountId: string, msg: object, text: string, contextToken?: string}) => Promise<void>} params.onMessage - 消息处理器
+ * @param {(err: unknown, msg: object) => void} [params.onMessageError] - 单条消息处理失败回调（不中断轮询）
  * @param {(err: Error) => void} [params.onFatal] - 致命错误回调（如 token 失效）
  * @returns {Promise<void>}
  */
 export async function runPollingLoop(params) {
-  const { account, signal, onMessage, onFatal } = params;
+  const { account, signal, onMessage, onMessageError, onFatal } = params;
   const accountId = account.accountId;
 
   if (!account.token) {
@@ -250,6 +251,9 @@ export async function runPollingLoop(params) {
           // 单条消息处理失败不应中断整个轮询
           logger.error(`polling: onMessage failed: ${String(err)}`);
           if (err && err.stack) logger.debug(String(err.stack));
+          // 失败必须让上层知道，否则「消息静默消失」——用户侧只看到
+          // 发出去没回应，运维侧只有这一行日志，无从判断是哪一环断的。
+          onMessageError?.(err, msg);
         }
       }
     } catch (err) {

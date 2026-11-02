@@ -201,6 +201,37 @@ export function isAllowedSender(cfg, fromUserId) {
 }
 
 /**
+ * 判断一个错误是不是「这个 sessionId 已经存在」。
+ *
+ * DSH 里这条错误有两个来源、两种形态：
+ *   1. 持久化后端：`SessionAlreadyExistsError`（有 `name` 和 `sessionId`）；
+ *   2. `sessions.prepare()`：裸 `new Error('session "..." already exists')`
+ *      （`name === "Error"`，没有 `sessionId`）。
+ *
+ * 只匹配第 1 种是真实的线上故障：重启后磁盘上有日志、内存里没会话，第 2 种
+ * 就必然出现，然后整条入站消息被丢弃——用户侧看到的是"发消息不回、会话里
+ * 也查不到"，而日志只有一行 `onMessage failed`。
+ *
+ * 因此这里按「ID 出现 + 文案匹配」双条件识别，`name` 只作为快速通道。
+ *
+ * @param {unknown} err - 捕获到的错误
+ * @param {string} sessionId - 本次操作的会话 ID
+ * @returns {boolean} 是否属于"已存在"
+ */
+export function isSessionExistsError(err, sessionId) {
+  if (!err || typeof err !== "object") return false;
+  if (err.name === "SessionAlreadyExistsError") return true;
+
+  const message = typeof err.message === "string" ? err.message : "";
+  if (!/already exists/i.test(message)) return false;
+  // 有 sessionId 字段时优先比字段：同一条会话之外的同名错误不该被吞掉。
+  if (typeof err.sessionId === "string") return err.sessionId === sessionId;
+  // 原文案是 `session "<id>" already exists`，用 includes 比正则更不容易被
+  // ID 里的特殊字符（`@`、`-`、`_`）影响。
+  return message.includes(`"${sessionId}"`);
+}
+
+/**
  * 微信通道桥接器。
  */
 export class WeixinBridge {
@@ -215,6 +246,13 @@ export class WeixinBridge {
     this.channel = channel;
     /** @type {Map<string, object>} sessionId → Agent 句柄 */
     this.agents = new Map();
+    /**
+     * @type {WeakSet<object>} 已挂出站监听的 Agent 实例
+     *
+     * 用实例而非 sessionId 作键：同一会话可能换实例（resume 出新 Agent），
+     * 那时必须重新挂监听；而同一个实例被复用两次时不能再挂，否则回复发双份。
+     */
+    this.outboundAttached = new WeakSet();
     /**
      * @type {Map<string, Promise<object>>} sessionId → 进行中的创建任务
      *
@@ -631,11 +669,20 @@ export class WeixinBridge {
       agentPreset,
     });
     this.agents.set(sessionId, handle);
-    this.attachOutbound(sessionId, handle.agent);
+
+    // 出站监听按 **Agent 实例** 去重，不按会话 ID：
+    // 同一个 Agent 被复用（Web UI 打开过、上一轮桥接遗留）时不能重复 attach，
+    // 否则一条回复会发两遍；而换成新实例后又必须重新挂，否则永远收不到回复。
+    // WeakSet 用实例做键，正好表达这个语义，且不阻止旧实例被回收。
+    if (!this.outboundAttached.has(handle.agent)) {
+      this.attachOutbound(sessionId, handle.agent);
+      this.outboundAttached.add(handle.agent);
+    }
 
     logger.info(
       `bridge: agent ready session=${sessionId} account=${accountId} user=${fromUserId} `
-        + `model=${selection.provider}/${selection.model} preset=${agentPreset ?? "(default)"}`,
+        + `model=${selection.provider}/${selection.model} preset=${agentPreset ?? "(default)"}`
+        + `${handle.reused ? " (reused)" : ""}`,
     );
     return handle.agent;
   }
@@ -680,13 +727,30 @@ export class WeixinBridge {
   /**
    * 先建，撞 ID 就恢复。
    *
-   * `create()` 失败时可能已在注册表留下痕迹，因此恢复前先清一次。
+   * **不要把 `err.name` 当唯一判据**：DSH 里有两个不同的"已存在"错误——
+   * `SessionAlreadyExistsError`（持久化后端抛的）和 `sessions.prepare()` 里
+   * 那句裸 `new Error('session "..." already exists')`（内存 store 里已有同名
+   * 会话时抛的，name 就是 `Error`）。只认前者会让后者一路冒到轮询循环，
+   * 表现为「微信发消息完全没反应、会话列表里也查不到」——消息在进 Agent 之前
+   * 就被丢了，连一条日志都只是 `onMessage failed`。
+   *
+   * 所以这里按 `sessionId` + 文案双条件识别，并在恢复前清掉孤儿会话。
    *
    * @param {object} opts - 创建/恢复参数
    * @returns {Promise<object>} Agent 句柄
    */
   async createOrResume(opts) {
     const { sessionId, cwd, agentOptions, setup, agentPreset } = opts;
+
+    // 内存里已经有这个会话的 Agent（Web UI 打开过、或上一轮没被回收）：
+    // 直接复用，避免 create/resume 在同一 ID 上互相打架。
+    const liveAgent = this.ctx.agents.get(sessionId);
+    if (liveAgent) {
+      logger.info(`bridge: reuse live agent session=${sessionId}`);
+      // `dispose` 必须是空操作：这个 Agent 的生命周期归 Web UI / 会话控制器管，
+      // 桥接只是借用。真去 dispose 会把用户正在看的那个会话一起干掉。
+      return { agent: liveAgent, reused: true, dispose: async () => {} };
+    }
 
     try {
       return await this.ctx.agents.create({
@@ -701,11 +765,11 @@ export class WeixinBridge {
         setup,
       });
     } catch (err) {
-      if (err?.name !== "SessionAlreadyExistsError") throw err;
-      logger.info(`bridge: session ${sessionId} exists on disk, resuming`);
+      if (!isSessionExistsError(err, sessionId)) throw err;
+      logger.info(`bridge: session ${sessionId} already exists, resuming`);
     }
 
-    // 注册表里若有残留，先踢掉，否则 resume 也会撞 ID
+    // 注册表里若有残留 agent，先释放，否则 resume 也会撞 ID
     const stale = this.ctx.agents.get(sessionId);
     if (stale) {
       logger.warn(`bridge: evicting stale in-memory agent ${sessionId}`);
@@ -716,13 +780,64 @@ export class WeixinBridge {
       }
     }
 
-    const handle = await this.ctx.agents.resume({
-      resumeSessionId: sessionId,
-      agentOptions,
-      setup,
-    });
+    // 只剩 session、没有 agent 的孤儿也要清：`resume()` 内部同样走
+    // `sessions.prepare()`，store 里占着 ID 就一样抛 "already exists"。
+    // 这种孤儿是"重启后消息不回"的直接产物——磁盘日志被别的组件重新
+    // prepare 进内存，但对应的 Agent 从未发布或已被回收。
+    if (this.detachOrphanSession(sessionId)) {
+      logger.warn(`bridge: detached orphan session ${sessionId} before resume`);
+    }
 
-    return handle;
+    try {
+      return await this.ctx.agents.resume({
+        resumeSessionId: sessionId,
+        agentOptions,
+        setup,
+      });
+    } catch (err) {
+      if (!isSessionExistsError(err, sessionId)) throw err;
+      // 清理与 resume 之间有别的组件又把它塞回 store，再清一次重试。
+      logger.warn(`bridge: session ${sessionId} re-appeared, detaching and retrying resume`);
+      this.detachOrphanSession(sessionId);
+      return await this.ctx.agents.resume({
+        resumeSessionId: sessionId,
+        agentOptions,
+        setup,
+      });
+    }
+  }
+
+  /**
+   * 摘掉"有会话、没 Agent"的孤儿条目。
+   *
+   * `sessions` 服务没有公开的 detach API（`enter()` 返回的闭包不给外部），
+   * 但 store 是普通 Map；在没有存活 Agent 的前提下按 ID 删除是安全的——
+   * 磁盘上的日志不动，下一次 `resume()` 会从持久化重新读出来。
+   *
+   * @param {string} sessionId - 会话 ID
+   * @returns {boolean} 是否真的摘掉了
+   */
+  detachOrphanSession(sessionId) {
+    // 有 Agent 就说明这个会话正在用，绝不能动。
+    if (this.ctx.agents.get(sessionId)) return false;
+
+    // **必须用 `ctx.get()`，不能写 `ctx.sessions`**：cordis 里访问未在
+    // `inject` 声明过的服务会直接抛 `cannot get property "sessions" without inject`，
+    // 而不是返回 undefined。`sessions` 只在部分 profile 提供，进 `inject` 会让
+    // 整个插件在不提供它的 profile 下永久 pending，所以只能运行期可选读取。
+    const sessions = this.ctx.get?.("sessions");
+    const store = sessions?.store;
+    if (!store || typeof store.has !== "function" || !store.has(sessionId)) return false;
+
+    try {
+      // detachEntered 会同时发 `session/disposed`，但那条路径是给已 announce
+      // 的条目用的；这里直接删 Map，避免触发一轮与我们无关的清理回调。
+      store.delete(sessionId);
+      return true;
+    } catch (err) {
+      logger.warn(`bridge: detach orphan session failed ${sessionId}: ${String(err)}`);
+      return false;
+    }
   }
 
   /**
@@ -1223,6 +1338,62 @@ export class WeixinBridge {
   }
 
   /**
+   * 给指定微信用户发一条系统提示（不依赖 `replyTargets`）。
+   *
+   * 与 `sendText` 的区别：`sendText` 靠 `replyTargets` 反查接收人，那条映射只在
+   * 入站**成功**之后才建立。而这里要用在"入站处理失败"的场景——映射根本不存在，
+   * 走 `sendText` 会静默 return，用户端依旧什么提示都收不到。
+   *
+   * 刻意只做一次尝试、失败只记日志：这是错误提示，不值得为它重试退避，
+   * 更不能因为提示发不出去而把原始错误盖掉。
+   *
+   * @param {object} params - 参数
+   * @param {string} params.accountId - 账号 ID
+   * @param {string} params.toUserId - 接收者
+   * @param {string} params.text - 提示文本
+   * @param {string} [params.contextToken] - 入站消息带来的令牌（回复必须带回）
+   * @returns {Promise<boolean>} 是否发出
+   */
+  async sendNotice({ accountId, toUserId, text, contextToken }) {
+    if (!toUserId || !text) return false;
+
+    const accounts = this.channel.listAccounts();
+    const account =
+      (accountId ? accounts.find((a) => a.accountId === accountId && a.token) : null)
+      ?? this.channel.getAccountForSender(toUserId);
+    if (!account) {
+      logger.warn(`bridge: sendNotice 找不到可用账号 account=${accountId} to=${toUserId}`);
+      return false;
+    }
+
+    const token =
+      contextToken
+      ?? this.channel.getContextToken(toUserId)
+      ?? getContextToken(account.accountId, toUserId);
+
+    await this.respectSendGap();
+    await sendMessage({
+      baseUrl: account.baseUrl,
+      token: account.token,
+      body: {
+        msg: {
+          from_user_id: "",
+          to_user_id: toUserId,
+          client_id: generateClientId(),
+          message_type: 2, // BOT
+          message_state: 2, // FINISH
+          item_list: [{ type: ITEM_TYPE.TEXT, text_item: { text } }],
+          context_token: token || undefined,
+        },
+      },
+    });
+
+    this.lastSentAt = Date.now();
+    logger.info(`bridge: notice sent account=${account.accountId} to=${toUserId} len=${text.length}`);
+    return true;
+  }
+
+  /**
    * 保证相邻两次发送至少间隔 `sendGapMs`。
    *
    * **必须是"占位"语义，不能只读时间戳再睡**：原实现是
@@ -1676,7 +1847,9 @@ export class WeixinBridge {
 
     for (const handle of handles) {
       try {
-        await handle.dispose();
+        // 复用的 Agent 归会话控制器管（可能是用户在 Web UI 里正打开的会话），
+        // 桥接不能顺手销毁它。`dispose` 在复用分支里就是空操作。
+        await handle.dispose?.();
       } catch (err) {
         logger.warn(`bridge: dispose agent failed: ${String(err)}`);
       }

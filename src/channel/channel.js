@@ -242,6 +242,30 @@ export class WeixinChannel {
             msg,
           });
         },
+        onMessageError: (err, msg) => {
+          // 记到账号状态上，UI 的「最近错误」能看到；
+          // 只写日志的话，线上排查必须翻 journalctl 才能发现入站全挂。
+          const state = this.accounts.get(accountId) ?? {};
+          this.accounts.set(accountId, {
+            ...state,
+            lastError: String(err?.message ?? err),
+            lastErrorAt: Date.now(),
+          });
+          // 静默丢消息是最难排查的故障。给用户一句回执，至少能区分
+          // 「没收到」和「收到了但处理失败」，也让运维从聊天窗口就知道出事了。
+          const to = msg?.from_user_id;
+          if (!to) return;
+          this.bridge
+            ?.sendNotice?.({
+              accountId,
+              toUserId: to,
+              text: "消息已收到，但处理时出错了，请稍后再试或联系管理员。",
+              contextToken: msg?.context_token,
+            })
+            .catch((noticeErr) => {
+              logger.debug(`channel: failure notice not delivered: ${String(noticeErr)}`);
+            });
+        },
         onFatal: (err) => {
           const state = this.accounts.get(accountId) ?? {};
           this.accounts.set(accountId, {
