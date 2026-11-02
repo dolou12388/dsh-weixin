@@ -49,6 +49,14 @@ export class WeixinChannel {
     this.lastInboundAt = new Map();
     /** @type {Promise<void>[]} 轮询任务 */
     this.pollTasks = [];
+    /**
+     * @type {number} 仍在运行的轮询任务数
+     *
+     * `running` 只表示"用户启动过"，不等于"真的在收消息"。轮询任务可能因为
+     * token 失效等原因自行退出，此时必须靠这个计数判断通道是否还有活的轮询，
+     * 否则 UI 会一直停在"运行中"，而启动按钮已被换成"停止"，用户无路可走。
+     */
+    this.activePollers = 0;
   }
 
   /**
@@ -167,8 +175,19 @@ export class WeixinChannel {
    */
   async start() {
     if (this.running) {
-      logger.warn("channel.start: already running");
-      return;
+      // 轮询任务可能已全部退出但标志没复位（异常路径或旧版本遗留）。
+      // 此时直接返回会让 UI 卡在"运行中"且无法恢复，故先自愈再继续启动。
+      if (this.activePollers > 0) {
+        logger.warn("channel.start: already running");
+        return;
+      }
+      logger.warn("channel.start: running flag was stale (no live pollers), restarting");
+      this.running = false;
+      this.pollTasks = [];
+      if (this.abortController) {
+        this.abortController.abort();
+        this.abortController = null;
+      }
     }
 
     const accounts = this.listAccounts().filter((acc) => acc.token);
@@ -179,6 +198,7 @@ export class WeixinChannel {
     this.abortController = new AbortController();
     this.bridge = new WeixinBridge(this.ctx, this.cfg, this);
     this.pollTasks = [];
+    this.activePollers = accounts.length;
 
     for (const account of accounts) {
       this.accounts.set(account.accountId, { running: true, lastError: null });
@@ -239,6 +259,21 @@ export class WeixinChannel {
         lastError: String(err?.message ?? err),
       });
       logger.error(`channel: account ${accountId} polling stopped: ${String(err)}`);
+    } finally {
+      this.activePollers = Math.max(0, this.activePollers - 1);
+
+      // 所有轮询任务都已退出：通道实际上不再收消息，必须把通道级标志一起复位。
+      // 只改账号级状态会让 UI 停在「轮询运行中」、按钮变成「停止」，
+      // 用户既看不到真实状态，也没有可点的「启动」——只能重启进程。
+      //
+      // `signal.aborted` 时是主动 stop()，标志已由 stop 处理，不必重复。
+      if (this.running && !signal.aborted && this.activePollers === 0) {
+        this.running = false;
+        for (const [id, state] of this.accounts) {
+          this.accounts.set(id, { ...state, running: false });
+        }
+        logger.warn("channel: all pollers exited, channel marked stopped");
+      }
     }
   }
 
@@ -261,6 +296,8 @@ export class WeixinChannel {
     if (tasks.length > 0) {
       await Promise.allSettled(tasks);
     }
+    // 任务自身的 finally 已逐个递减，这里兜底归零，避免计数残留。
+    this.activePollers = 0;
 
     if (this.bridge) {
       await this.bridge.dispose();

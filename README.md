@@ -86,7 +86,7 @@ dsh plugin --profile web add dolou12388/dsh-weixin
 dsh plugin --profile web add git+https://github.com/dolou12388/dsh-weixin.git
 
 # 固定版本（推荐生产使用，避免跟随 main 变动）
-dsh plugin --profile web add git+https://github.com/dolou12388/dsh-weixin.git#v0.2.0
+dsh plugin --profile web add git+https://github.com/dolou12388/dsh-weixin.git#v0.3.0
 ```
 
 仓库地址：<https://github.com/dolou12388/dsh-weixin>
@@ -165,7 +165,7 @@ dsh plugin --profile web remove dsh-weixin
 | **通道状态** | 查看运行状态、一键启动/停止 |
 | **连接微信** | 点「扫码登录」→ 页面直接显示二维码 → 手机扫码即完成 |
 | **已登录账号** | 查看账号 ID、登录日期，可删除 |
-| **通道配置** | 出站模式、会话模式、开关、白名单，**点一下即保存生效** |
+| **通道配置** | 出站模式、会话模式、启动自轮询、开关、白名单，**点一下即保存生效** |
 | **自动发送** | 时间段、节奏、命中率、冷却、接收者，以及「立即发一条」测试 |
 
 配置交互约定：
@@ -192,6 +192,13 @@ UI 设置存放在 `$DSH_HOME/storages/dsh-weixin/settings.json`，
 | `/weixin stop` | 停止轮询 | 「停止」按钮 |
 
 > 界面与命令操作同一份状态，二者可以混用。
+
+### 通道生命周期
+
+- **启动时机**：插件加载后若已有可用账号，会自动拉起轮询（`channel.autoStart`，默认开启）。
+  关掉该开关后才需要手动点「启动」或执行 `/weixin start`。
+- **状态口径**：页面上的「轮询运行中」按**账号级**轮询状态判定。轮询任务因 token 失效等原因
+  全部退出时，通道会一并标记为停止并附带原因，按钮回到「启动」——不需要重启进程。
 
 ## 自动发送（随机骰子）
 
@@ -302,7 +309,8 @@ UI 设置存放在 `$DSH_HOME/storages/dsh-weixin/settings.json`，
 | `session.cwd` | `""` | 是 | 会话工作目录，空=DSH 默认（改后需重启） |
 | `session.idPrefix` | `weixin` | — | 会话 ID 前缀，避免与 Web UI 冲突 |
 | `session.agentPreset` | `""` | — | Agent 预设 ID，空=用 DSH 默认预设。**留空时仍会自动取默认预设，否则 Agent 没有工具** |
-| `channel.botAgent` | `dsh-weixin/0.2.0` | — | 写入 `base_info.bot_agent` |
+| `channel.botAgent` | `dsh-weixin/0.3.0` | — | 写入 `base_info.bot_agent` |
+| `channel.autoStart` | `true` | 是 | 插件加载时自动拉起轮询；关闭后需手动点「启动」 |
 | `autoSend.enabled` | `false` | 是 | 自动发送总开关 |
 | `autoSend.startTime` | `09:00` | 是 | 时间段起点（含），`HH:MM` |
 | `autoSend.endTime` | `23:00` | 是 | 时间段终点（不含），支持跨零点 |

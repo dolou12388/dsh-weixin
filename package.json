@@ -1,6 +1,6 @@
 {
   "name": "dsh-weixin",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "DeepSeek Harness 微信通道插件：iLink Bot 长轮询收发，接入 DSH Agent 会话",
   "type": "module",
   "main": "src/index.js",

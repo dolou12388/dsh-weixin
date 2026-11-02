@@ -125,6 +125,14 @@ export const DEFAULT_CONFIG = {
     routeTag: "",
     /** 写入 base_info.bot_agent 的值。 */
     botAgent: "",
+    /**
+     * 插件加载时自动拉起轮询。
+     *
+     * 默认开启。否则 DSH 每次重启（更新、崩溃、手动重启）后都要去设置页
+     * 手动点一次「启动」，这段时间消息不会被接收；而自动发送走 `ctx.effect`
+     * 会自动启动，两者行为不一致会造成"看起来在跑"的误判。
+     */
+    autoStart: true,
     /** 单账号覆盖。 */
     accounts: {},
   },
@@ -226,6 +234,7 @@ function buildSchemasteryConfig() {
         DEFAULT_CONFIG.channel.routeTag,
       ),
       botAgent: Schema.string().default(DEFAULT_CONFIG.channel.botAgent),
+      autoStart: Schema.boolean().default(DEFAULT_CONFIG.channel.autoStart),
       accounts: Schema.dict(Schema.any()).default(DEFAULT_CONFIG.channel.accounts),
     }).default(DEFAULT_CONFIG.channel),
     globalPrompt: Schema.string()
@@ -580,6 +589,7 @@ export function normalizeConfig(config) {
 
   // 通道配置兜底
   if (!isPlainObject(merged.channel.accounts)) merged.channel.accounts = {};
+  merged.channel.autoStart = merged.channel.autoStart !== false;
 
   return merged;
 }

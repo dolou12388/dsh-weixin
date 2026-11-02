@@ -240,6 +240,13 @@ export function normalizeSettingsPatch(patch) {
     else settings.typingIndicator = v;
   }
 
+  // 通道自启属于 channel 组，字段名加前缀避免与顶层开关 `enabled` 混淆。
+  if ("channelAutoStart" in src) {
+    const v = toBool(src.channelAutoStart);
+    if (v === null) errors.push("channelAutoStart 必须是布尔值");
+    else settings.channel = Object.assign(settings.channel ?? {}, { autoStart: v });
+  }
+
   if ("replyProgressMessages" in src) {
     const v = toBool(src.replyProgressMessages);
     if (v === null) errors.push("replyProgressMessages 必须是布尔值");

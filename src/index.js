@@ -121,6 +121,28 @@ export function apply(ctx, config) {
     return () => autoSend.stop();
   }, "dsh-weixin.autoSend()");
 
+  // 通道自启：进程重启后自动拉起轮询。
+  //
+  // 默认开启。否则每次重启服务（更新、崩溃、手动重启）都要去设置页点一次
+  // 「启动」，这段时间消息进不来；而自动发送是自动启动的，两者行为不一致
+  // 会让人误以为通道也在跑。
+  ctx.effect(() => {
+    if (cfg.channel?.autoStart === false) {
+      logger.info("dsh-weixin: channel autoStart disabled by config");
+      return () => {};
+    }
+    const ready = channel.listAccounts().filter((acc) => acc.token);
+    if (ready.length === 0) {
+      logger.info("dsh-weixin: channel autoStart skipped (no logged-in account)");
+      return () => {};
+    }
+    // 失败不阻断插件加载：账号失效时应当从设置页重新登录，而不是让整插件挂掉。
+    channel.start().catch((err) => {
+      logger.warn(`dsh-weixin: channel autoStart failed: ${String(err)}`);
+    });
+    return () => {};
+  }, "dsh-weixin.channel()");
+
   // 全局设定：注入到 Agent 系统提示。空内容时自动跳过，不留空 section。
   ctx.effect(() => {
     promptRegistry = new GlobalPromptRegistry(ctx, cfg);

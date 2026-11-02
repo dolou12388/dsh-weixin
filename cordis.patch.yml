@@ -39,7 +39,9 @@
         # 通道级配置
         channel:
           routeTag: ''
-          botAgent: 'dsh-weixin/0.2.0'
+          botAgent: 'dsh-weixin/0.3.0'
+          # 插件加载时自动拉起轮询；关掉后需手动点「启动」
+          autoStart: true
           accounts: {}
         # 自动发送（随机骰子冒泡）。默认关闭——开启后是真实的对外发消息。
         autoSend:
