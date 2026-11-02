@@ -232,7 +232,20 @@ export function registerWeixinRoutes(ctx, channel, cfg, baseCfg, hooks) {
         globalPrompt: cfg.globalPrompt ?? "",
         mediaInbound: cfg.media?.inbound !== false,
         mediaOutbound: cfg.media?.outbound !== false,
+        autoSendEnabled: cfg.autoSend?.enabled === true,
+        autoSendStart: cfg.autoSend?.startTime ?? "09:00",
+        autoSendEnd: cfg.autoSend?.endTime ?? "23:00",
+        autoSendBaseIntervalMin: cfg.autoSend?.baseIntervalMin ?? 30,
+        autoSendActiveIntervalMin: cfg.autoSend?.activeIntervalMin ?? 5,
+        autoSendHitRate: cfg.autoSend?.hitRate ?? 0.2,
+        autoSendMaxStreak: cfg.autoSend?.maxStreak ?? 5,
+        autoSendCooldownMin: cfg.autoSend?.cooldownMin ?? 120,
+        autoSendTargets: Array.isArray(cfg.autoSend?.targets) ? cfg.autoSend.targets : [],
+        autoSendMaxChars: cfg.autoSend?.maxChars ?? 120,
+        autoSendInstruction: cfg.autoSend?.instruction ?? "",
       },
+      /** 自动发送的实时调度状态（下次掷骰时间、节奏、统计）。 */
+      autoSendStatus: hooks?.autoSend?.status?.() ?? null,
       /** 已被 UI 覆盖的配置分组（顶层键）。 */
       overridden,
     });
@@ -267,6 +280,11 @@ export function registerWeixinRoutes(ctx, channel, cfg, baseCfg, hooks) {
         hooks.onGlobalPromptChange();
       }
 
+      // 4) 自动发送的开关/节奏直接决定定时器落点，改完立即重新对齐。
+      if ("autoSend" in settings && hooks?.onAutoSendChange) {
+        hooks.onAutoSendChange();
+      }
+
       const needsRestart = restartRequiredFor(settings);
       logger.info(
         `settings updated: ${Object.keys(settings).join(", ")}` +
@@ -291,7 +309,19 @@ export function registerWeixinRoutes(ctx, channel, cfg, baseCfg, hooks) {
           globalPrompt: cfg.globalPrompt ?? "",
           mediaInbound: cfg.media?.inbound !== false,
           mediaOutbound: cfg.media?.outbound !== false,
+          autoSendEnabled: cfg.autoSend?.enabled === true,
+          autoSendStart: cfg.autoSend?.startTime,
+          autoSendEnd: cfg.autoSend?.endTime,
+          autoSendBaseIntervalMin: cfg.autoSend?.baseIntervalMin,
+          autoSendActiveIntervalMin: cfg.autoSend?.activeIntervalMin,
+          autoSendHitRate: cfg.autoSend?.hitRate,
+          autoSendMaxStreak: cfg.autoSend?.maxStreak,
+          autoSendCooldownMin: cfg.autoSend?.cooldownMin,
+          autoSendTargets: cfg.autoSend?.targets ?? [],
+          autoSendMaxChars: cfg.autoSend?.maxChars,
+          autoSendInstruction: cfg.autoSend?.instruction ?? "",
         },
+        autoSendStatus: hooks?.autoSend?.status?.() ?? null,
         needsRestart,
       });
     } catch (err) {
@@ -310,6 +340,8 @@ export function registerWeixinRoutes(ctx, channel, cfg, baseCfg, hooks) {
         rollbackInPlace(cfg, baseCfg);
         // 回滚后全局设定可能变空，重新注册才能撤掉旧 section
         hooks?.onGlobalPromptChange?.();
+        // 自动发送的开关/节奏也被回滚了，定时器要跟着对齐
+        hooks?.onAutoSendChange?.();
         logger.info("settings overlay reset; in-memory config rolled back to plugin config");
         return json({ ok: true, needsRestart: false });
       }
@@ -324,6 +356,32 @@ export function registerWeixinRoutes(ctx, channel, cfg, baseCfg, hooks) {
       logger.error(`settings reset failed: ${String(err)}`);
       return json({ ok: false, error: String(err) }, 500);
     }
+  });
+
+  // -------------------------------------------------------------------------
+  // 自动发送
+  // -------------------------------------------------------------------------
+
+  /**
+   * 立即发一条（跳过骰子）。
+   *
+   * 存在的意义是"让用户先确认发送链路通"：配好时间窗与概率后，
+   * 若真要等命中最长得等好几个基础间隔，没法验证配置是否生效。
+   */
+  route("autosend/trigger", ["POST"], async () => {
+    const scheduler = hooks?.autoSend;
+    if (!scheduler) {
+      return json({ ok: false, error: "自动发送未装配" }, 503);
+    }
+    if (channel.running !== true) {
+      return json({ ok: false, error: "通道未启动，请先启动轮询" }, 409);
+    }
+
+    const result = await scheduler.triggerNow();
+    if (!result.ok) {
+      logger.warn(`autosend/trigger failed: ${String(result.reason)}`);
+    }
+    return json(result, result.ok ? 200 : 409);
   });
 
   // -------------------------------------------------------------------------

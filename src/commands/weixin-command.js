@@ -56,7 +56,7 @@ export function registerWeixinCommand(ctx, cfg, channel) {
           return await handleStop(channel);
         case "status":
         default:
-          return handleStatus(channel);
+          return handleStatus(channel, cfg);
       }
     },
   });
@@ -120,15 +120,21 @@ async function handleLogin(cfg) {
  * 处理状态查询。
  *
  * @param {object} channel - 通道实例
+ * @param {object} cfg - 归一化配置
  * @returns {{kind: string, text: string}} 命令结果
  */
-function handleStatus(channel) {
+function handleStatus(channel, cfg) {
   const snap = channel.snapshot();
+  const auto = cfg?.autoSend;
+  const autoLine = auto?.enabled
+    ? `自动发送：已开启（${auto.startTime}-${auto.endTime}，基础 ${auto.baseIntervalMin} 分钟，命中率 ${Math.round((auto.hitRate ?? 0) * 100)}%）`
+    : "自动发送：关闭";
   const lines = [
     `轮询：${snap.running ? "运行中" : "未启动"}`,
     `出站模式：${snap.config.outboundMode}`,
     `会话模式：${snap.config.sessionMode}`,
     `账号数：${snap.accountCount}`,
+    autoLine,
   ];
 
   if (snap.accountCount === 0) {

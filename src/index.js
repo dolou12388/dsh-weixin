@@ -18,6 +18,7 @@ import { resolveDshHome, resolveStoreDir } from "./util/paths.js";
 import { assertDshCompatibility } from "./compat.js";
 import { WeixinChannel } from "./channel/channel.js";
 import { GlobalPromptRegistry } from "./bridge/global-prompt.js";
+import { createAutoSendScheduler } from "./auto-send/index.js";
 import { registerWeixinCommand } from "./commands/weixin-command.js";
 import { registerWeixinRoutes, disposeRoutes } from "./web/routes.js";
 
@@ -111,6 +112,15 @@ export function apply(ctx, config) {
 
   const channel = new WeixinChannel(ctx, cfg);
 
+  // 自动发送（随机骰子冒泡）。配置未开启时 start() 会直接返回，
+  // 不会留下任何定时器。
+  const autoSend = createAutoSendScheduler({ cfg, channel });
+
+  ctx.effect(() => {
+    autoSend.start();
+    return () => autoSend.stop();
+  }, "dsh-weixin.autoSend()");
+
   // 全局设定：注入到 Agent 系统提示。空内容时自动跳过，不留空 section。
   ctx.effect(() => {
     promptRegistry = new GlobalPromptRegistry(ctx, cfg);
@@ -139,6 +149,10 @@ export function apply(ctx, config) {
           promptRegistry?.refresh();
           channel?.bridge?.invalidatePrompt();
         },
+        // 自动发送的开关/节奏/概率改动后立即重新对齐定时器，
+        // 否则要等满一个基础间隔（默认 30 分钟）才按新参数跑。
+        onAutoSendChange: () => autoSend.refresh(),
+        autoSend,
       });
       logger.info(`dsh-weixin web routes registered (${disposers.length} endpoints)`);
       webCtx.effect(

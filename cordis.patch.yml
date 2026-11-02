@@ -39,5 +39,27 @@
         # 通道级配置
         channel:
           routeTag: ''
-          botAgent: 'dsh-weixin/0.1.1'
+          botAgent: 'dsh-weixin/0.2.0'
           accounts: {}
+        # 自动发送（随机骰子冒泡）。默认关闭——开启后是真实的对外发消息。
+        autoSend:
+          enabled: false
+          # 允许发送的时间段，支持跨零点（22:00 至 02:00）；两端相同表示全天
+          startTime: '09:00'
+          endTime: '23:00'
+          # 基础节奏：每隔多少分钟掷一次骰子，未命中就再来一轮
+          baseIntervalMin: 30
+          # 活跃节奏：命中发出一条后，改成每隔多少分钟掷一次
+          activeIntervalMin: 5
+          # 单次掷骰的命中概率（0–1）
+          hitRate: 0.2
+          # 连续命中上限，达到后强制冷却
+          maxStreak: 5
+          # 冷却时长（分钟）
+          cooldownMin: 120
+          # 接收者微信 userId；留空表示发给最近互动过的用户
+          targets: []
+          # 单条最大字符数，超出截断
+          maxChars: 120
+          # 生成指令；留空使用内置默认指令
+          instruction: ''

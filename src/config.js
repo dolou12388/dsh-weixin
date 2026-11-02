@@ -20,6 +20,7 @@
  * 用 `createRequire` 而非顶层 `import`，就是为了让缺包变成"降级"而不是"崩溃"。
  */
 import { createRequire } from "node:module";
+import { normalizeClockText } from "./auto-send/time-window.js";
 
 const require = createRequire(import.meta.url);
 
@@ -145,6 +146,40 @@ export const DEFAULT_CONFIG = {
     /** 媒体落盘目录；留空则用 `$DSH_HOME/storages/dsh-weixin/media`。 */
     dir: "",
   },
+  /**
+   * 自动发送（随机骰子冒泡）。
+   *
+   * 语义：在允许的时间段内按节奏"掷骰子"，命中则让 Agent 主动生成一条
+   * 消息发出去。基础节奏命中后切到活跃节奏，活跃节奏连续命中会累积
+   * `maxStreak`，达到上限后强制冷却，避免刷屏。
+   *
+   * 默认**关闭**——主动对外发消息属于有外部副作用的动作，
+   * 必须由用户显式打开。
+   */
+  autoSend: {
+    /** 总开关。 */
+    enabled: false,
+    /** 允许发送的起始时刻（`HH:MM`，含）。 */
+    startTime: "09:00",
+    /** 允许发送的结束时刻（`HH:MM`，不含）。与起始相同表示全天。 */
+    endTime: "23:00",
+    /** 基础节奏：每隔多少分钟掷一次骰子。 */
+    baseIntervalMin: 30,
+    /** 活跃节奏：命中发送后，改成每隔多少分钟掷一次。 */
+    activeIntervalMin: 5,
+    /** 单次掷骰的命中概率（0–1）。 */
+    hitRate: 0.2,
+    /** 连续命中多少次后强制冷却。 */
+    maxStreak: 5,
+    /** 冷却时长（分钟）。 */
+    cooldownMin: 120,
+    /** 指定接收者 userId；留空则用最近互动过的用户。 */
+    targets: [],
+    /** 单条自动消息的最大字符数，超出截断。 */
+    maxChars: 120,
+    /** 生成指令；留空使用内置默认指令。 */
+    instruction: "",
+  },
 };
 
 /**
@@ -207,6 +242,41 @@ function buildSchemasteryConfig() {
       outbound: Schema.boolean().default(DEFAULT_CONFIG.media.outbound),
       dir: Schema.string().default(DEFAULT_CONFIG.media.dir),
     }).default(DEFAULT_CONFIG.media),
+    autoSend: Schema.object({
+      enabled: Schema.boolean().default(DEFAULT_CONFIG.autoSend.enabled),
+      // 时间用 `HH:MM` 字符串而非整数分钟：UI 的 <input type="time"> 直接给这个格式，
+      // 省一层换算，也让配置文件可读。
+      startTime: Schema.string().default(DEFAULT_CONFIG.autoSend.startTime),
+      endTime: Schema.string().default(DEFAULT_CONFIG.autoSend.endTime),
+      // 上限 1440（一天）：超过一天没有意义，还会让 setTimeout 溢出。
+      baseIntervalMin: Schema.natural()
+        .min(1)
+        .max(1440)
+        .default(DEFAULT_CONFIG.autoSend.baseIntervalMin),
+      activeIntervalMin: Schema.natural()
+        .min(1)
+        .max(1440)
+        .default(DEFAULT_CONFIG.autoSend.activeIntervalMin),
+      hitRate: Schema.number()
+        .min(0)
+        .max(1)
+        .default(DEFAULT_CONFIG.autoSend.hitRate),
+      maxStreak: Schema.natural()
+        .min(1)
+        .max(100)
+        .default(DEFAULT_CONFIG.autoSend.maxStreak),
+      // 冷却最长 7 天。
+      cooldownMin: Schema.natural()
+        .min(0)
+        .max(10080)
+        .default(DEFAULT_CONFIG.autoSend.cooldownMin),
+      targets: Schema.array(Schema.string()).default(DEFAULT_CONFIG.autoSend.targets),
+      maxChars: Schema.natural()
+        .min(10)
+        .max(1000)
+        .default(DEFAULT_CONFIG.autoSend.maxChars),
+      instruction: Schema.string().max(2000).default(DEFAULT_CONFIG.autoSend.instruction),
+    }).default(DEFAULT_CONFIG.autoSend),
   });
 }
 
@@ -359,6 +429,24 @@ function toBoundedInt(value, fallback, min, max) {
 }
 
 /**
+ * 把任意输入夹成合法浮点数。
+ *
+ * 与 `toBoundedInt` 的区别：不做取整。命中率这类 0–1 的概率值
+ * 若被四舍五入成 0 或 1，功能会直接退化成"永不发送"或"每次必发"。
+ *
+ * @param {unknown} value - 原始值
+ * @param {number} fallback - 非法时回退值
+ * @param {number} min - 下界
+ * @param {number} max - 上界
+ * @returns {number} 合法浮点数
+ */
+function toBoundedFloat(value, fallback, min, max) {
+  const n = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
+/**
  * 归一化用户配置，补齐默认值并夹紧非法取值。
  *
  * 与 schema 的分工：schema 在**加载期**拒绝非法配置（响亮失败），
@@ -440,6 +528,55 @@ export function normalizeConfig(config) {
   merged.media.inbound = merged.media.inbound !== false;
   merged.media.outbound = merged.media.outbound !== false;
   if (typeof merged.media.dir !== "string") merged.media.dir = "";
+
+  // 自动发送兜底。先保证是对象：UI 覆盖层若写入 `autoSend: "on"` 这类
+  // 非对象值，后面按属性赋值会在 undefined 上抛错，整条配置链失效。
+  if (!isPlainObject(merged.autoSend)) {
+    merged.autoSend = cloneConfigValue(DEFAULT_CONFIG.autoSend);
+  }
+  const autoSend = merged.autoSend;
+  autoSend.enabled = autoSend.enabled === true;
+  autoSend.startTime = normalizeClockText(
+    autoSend.startTime,
+    DEFAULT_CONFIG.autoSend.startTime,
+  );
+  autoSend.endTime = normalizeClockText(autoSend.endTime, DEFAULT_CONFIG.autoSend.endTime);
+  autoSend.baseIntervalMin = toBoundedInt(
+    autoSend.baseIntervalMin,
+    DEFAULT_CONFIG.autoSend.baseIntervalMin,
+    1,
+    1440,
+  );
+  autoSend.activeIntervalMin = toBoundedInt(
+    autoSend.activeIntervalMin,
+    DEFAULT_CONFIG.autoSend.activeIntervalMin,
+    1,
+    1440,
+  );
+  autoSend.hitRate = toBoundedFloat(
+    autoSend.hitRate,
+    DEFAULT_CONFIG.autoSend.hitRate,
+    0,
+    1,
+  );
+  autoSend.maxStreak = toBoundedInt(autoSend.maxStreak, DEFAULT_CONFIG.autoSend.maxStreak, 1, 100);
+  autoSend.cooldownMin = toBoundedInt(
+    autoSend.cooldownMin,
+    DEFAULT_CONFIG.autoSend.cooldownMin,
+    0,
+    10080,
+  );
+  autoSend.maxChars = toBoundedInt(autoSend.maxChars, DEFAULT_CONFIG.autoSend.maxChars, 10, 1000);
+  autoSend.targets = Array.isArray(autoSend.targets)
+    ? [...new Set(
+        autoSend.targets
+          .filter((v) => v !== null && v !== undefined)
+          .map((v) => String(v).trim())
+          .filter(Boolean),
+      )]
+    : [];
+  autoSend.instruction =
+    typeof autoSend.instruction === "string" ? autoSend.instruction : "";
 
   // 通道配置兜底
   if (!isPlainObject(merged.channel.accounts)) merged.channel.accounts = {};

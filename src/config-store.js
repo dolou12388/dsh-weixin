@@ -16,6 +16,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { resolveStoreDir, ensureDir } from "./util/paths.js";
 import { logger } from "./util/logger.js";
+import { parseClock } from "./auto-send/time-window.js";
 
 /** overlay 文件版本，便于将来迁移。 */
 const OVERLAY_VERSION = 1;
@@ -32,6 +33,18 @@ export const IDLE_MS_MAX = 60000;
 /** 相邻消息发送间隔的可选区间（毫秒）。 */
 export const SEND_GAP_MS_MIN = 0;
 export const SEND_GAP_MS_MAX = 10000;
+/** 自动发送节奏的可选区间（分钟）。 */
+export const AUTO_SEND_INTERVAL_MIN = 1;
+export const AUTO_SEND_INTERVAL_MAX = 1440;
+/** 自动发送连续命中上限的可选区间。 */
+export const AUTO_SEND_STREAK_MIN = 1;
+export const AUTO_SEND_STREAK_MAX = 100;
+/** 自动发送强制冷却的可选区间（分钟）。 */
+export const AUTO_SEND_COOLDOWN_MIN = 0;
+export const AUTO_SEND_COOLDOWN_MAX = 10080;
+/** 自动发送单条长度上限的可选区间（字符）。 */
+export const AUTO_SEND_CHARS_MIN = 10;
+export const AUTO_SEND_CHARS_MAX = 1000;
 
 /**
  * overlay 文件路径：`$DSH_HOME/storages/dsh-weixin/settings.json`。
@@ -277,6 +290,85 @@ export function normalizeSettingsPatch(patch) {
     const v = toBool(src.mediaOutbound);
     if (v === null) errors.push("mediaOutbound 必须是布尔值");
     else settings.media = Object.assign(settings.media ?? {}, { outbound: v });
+  }
+
+  // 自动发送：整组字段共用 `settings.autoSend`，逐项 Object.assign 累加，
+  // 这样 UI 每次只提交改动的那一个字段也不会把同组其它字段抹掉。
+  const auto = (patchFields) => {
+    settings.autoSend = Object.assign(settings.autoSend ?? {}, patchFields);
+  };
+
+  if ("autoSendEnabled" in src) {
+    const v = toBool(src.autoSendEnabled);
+    if (v === null) errors.push("autoSendEnabled 必须是布尔值");
+    else auto({ enabled: v });
+  }
+
+  for (const [field, key, label] of [
+    ["autoSendStart", "startTime", "autoSendStart"],
+    ["autoSendEnd", "endTime", "autoSendEnd"],
+  ]) {
+    if (!(field in src)) continue;
+    const v = String(src[field] ?? "").trim();
+    // 统一补零后再落盘，避免出现 "9:5" 这种下次解析仍合法、但排序比较会错的值。
+    const minutes = parseClock(v);
+    if (minutes === null) {
+      errors.push(`${label} 必须是 HH:MM 格式`);
+      continue;
+    }
+    const hh = String(Math.floor(minutes / 60)).padStart(2, "0");
+    const mm = String(minutes % 60).padStart(2, "0");
+    auto({ [key]: `${hh}:${mm}` });
+  }
+
+  if ("autoSendBaseIntervalMin" in src) {
+    const v = toBoundedInt(src.autoSendBaseIntervalMin, AUTO_SEND_INTERVAL_MIN, AUTO_SEND_INTERVAL_MAX);
+    if (v === null) errors.push("autoSendBaseIntervalMin 必须是整数");
+    else auto({ baseIntervalMin: v });
+  }
+
+  if ("autoSendActiveIntervalMin" in src) {
+    const v = toBoundedInt(src.autoSendActiveIntervalMin, AUTO_SEND_INTERVAL_MIN, AUTO_SEND_INTERVAL_MAX);
+    if (v === null) errors.push("autoSendActiveIntervalMin 必须是整数");
+    else auto({ activeIntervalMin: v });
+  }
+
+  if ("autoSendHitRate" in src) {
+    // 用 0–1 小数而非百分数：配置层存的就是小数，路由层再换算会让
+    // 「配置文件写 0.2、接口要传 20」这种隐性差异变成长期踩坑点。
+    const n = typeof src.autoSendHitRate === "number"
+      ? src.autoSendHitRate
+      : Number.parseFloat(String(src.autoSendHitRate ?? ""));
+    if (!Number.isFinite(n) || n < 0 || n > 1) errors.push("autoSendHitRate 必须在 0 到 1 之间");
+    else auto({ hitRate: n });
+  }
+
+  if ("autoSendMaxStreak" in src) {
+    const v = toBoundedInt(src.autoSendMaxStreak, AUTO_SEND_STREAK_MIN, AUTO_SEND_STREAK_MAX);
+    if (v === null) errors.push("autoSendMaxStreak 必须是整数");
+    else auto({ maxStreak: v });
+  }
+
+  if ("autoSendCooldownMin" in src) {
+    const v = toBoundedInt(src.autoSendCooldownMin, AUTO_SEND_COOLDOWN_MIN, AUTO_SEND_COOLDOWN_MAX);
+    if (v === null) errors.push("autoSendCooldownMin 必须是整数");
+    else auto({ cooldownMin: v });
+  }
+
+  if ("autoSendMaxChars" in src) {
+    const v = toBoundedInt(src.autoSendMaxChars, AUTO_SEND_CHARS_MIN, AUTO_SEND_CHARS_MAX);
+    if (v === null) errors.push("autoSendMaxChars 必须是整数");
+    else auto({ maxChars: v });
+  }
+
+  if ("autoSendTargets" in src) {
+    auto({ targets: toAllowList(src.autoSendTargets) });
+  }
+
+  if ("autoSendInstruction" in src) {
+    const v = String(src.autoSendInstruction ?? "");
+    if (v.length > 2000) errors.push("autoSendInstruction 超过 2000 字上限");
+    else auto({ instruction: v });
   }
 
   return { settings, errors };

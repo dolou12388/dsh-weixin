@@ -25,6 +25,7 @@ DeepSeek Harness 微信通道插件。移植自 `@tencent-weixin/openclaw-weixin
 | 发送频控保护 | 完成，500ms 间隔 + 4 次退避重试 + 收尾补发 |
 | 思考过程开关（`replyThinking`） | 完成，默认关闭；整段与流式两条出口都按 `type` 分流 |
 | 「正在输入」状态 | 完成，心跳 + 收尾主动发 `status: 2` 撤销 |
+| 自动发送（随机骰子冒泡） | 完成，双节奏 + 跨零点 + 连续上限冷却，状态可恢复 |
 
 ### 实现中遇到的硬坑
 
@@ -85,7 +86,7 @@ dsh plugin --profile web add dolou12388/dsh-weixin
 dsh plugin --profile web add git+https://github.com/dolou12388/dsh-weixin.git
 
 # 固定版本（推荐生产使用，避免跟随 main 变动）
-dsh plugin --profile web add git+https://github.com/dolou12388/dsh-weixin.git#v0.1.1
+dsh plugin --profile web add git+https://github.com/dolou12388/dsh-weixin.git#v0.2.0
 ```
 
 仓库地址：<https://github.com/dolou12388/dsh-weixin>
@@ -157,7 +158,7 @@ dsh plugin --profile web remove dsh-weixin
 ### 图形界面（推荐）
 
 启动 `dsh --profile web` 后，左侧栏「插件」按钮**正下方**会出现绿色的微信图标。
-点击进入「微信通道」设置页，四个区块：
+点击进入「微信通道」设置页，五个区块：
 
 | 区块 | 可做的事 |
 |---|---|
@@ -165,6 +166,7 @@ dsh plugin --profile web remove dsh-weixin
 | **连接微信** | 点「扫码登录」→ 页面直接显示二维码 → 手机扫码即完成 |
 | **已登录账号** | 查看账号 ID、登录日期，可删除 |
 | **通道配置** | 出站模式、会话模式、开关、白名单，**点一下即保存生效** |
+| **自动发送** | 时间段、节奏、命中率、冷却、接收者，以及「立即发一条」测试 |
 
 配置交互约定：
 
@@ -190,6 +192,72 @@ UI 设置存放在 `$DSH_HOME/storages/dsh-weixin/settings.json`，
 | `/weixin stop` | 停止轮询 | 「停止」按钮 |
 
 > 界面与命令操作同一份状态，二者可以混用。
+
+## 自动发送（随机骰子）
+
+让 Agent 在设定的时间段内**主动**发消息，节奏由掷骰子决定。默认关闭。
+
+### 调度逻辑
+
+不是固定间隔的定时器，而是双节奏状态机：
+
+```
+在时间段内？ ── 否 ──→ 睡到下一个时间段开始
+     │是
+     ▼
+[基础节奏] 等 N 分钟 → 掷骰子
+     ├─ 未命中 ─→ 再等 N 分钟（继续基础节奏）
+     └─ 命中  ─→ 发送 → 切到活跃节奏
+                  │
+     ┌────────────┘
+     ▼
+[活跃节奏] 等 5 分钟 → 掷骰子
+     ├─ 命中  ─→ 再发一条（留在活跃节奏，可连续多条）
+     └─ 未命中 ─→ 退回基础节奏，重新等 N 分钟
+```
+
+三个附加规则：
+
+- **跨零点**：`22:00` 到 `02:00` 合法，内部拆成 `[22:00, 24:00)` 与 `[00:00, 02:00)` 两段判断。
+  起止填相同表示全天。
+- **强制冷却**：连续命中达到 `maxStreak` 后停 `cooldownMin` 分钟再回基础节奏，
+  避免运气好时刷屏。
+- **仅一个定时器**：每轮只排"下一次掷骰"，状态落盘到 `autosend-state.json`。
+  进程重启后按原计划恢复；若已过期超过 5 分钟则顺延一个基础间隔，不会开机瞬间补发。
+
+### 发送什么
+
+命中的那一刻让**该用户的 Agent 会话**主动生成一条消息，复用正常对话的出站链路
+（`agent.followup` → `turn-stopping` → `sendMessage`）。因此：
+
+- 内容会接着之前的聊天上下文，不是模板句；
+- 回合结束后回复被压成单行并截到 `maxChars` 字，冒泡不会变成一屏长文；
+- 该回合跳过流式增量下发（流式边生成边发，来不及截断）。
+
+### 发送给谁
+
+按优先级取第一个**持有 `context_token`** 的用户（微信要求回复带回该令牌，没有就发不出去）：
+
+1. `autoSend.targets` 里配置的 userId；
+2. 最近一次入站消息的发送者；
+3. 上次自动发送的目标。
+
+三者都没有时不会"随便挑一个"，而是记一次失败并提示去配置 `targets`。
+
+### 前置条件
+
+命中后仍需满足，否则本轮跳过并按基础间隔顺延：
+
+| 条件 | 不满足时的表现 |
+|---|---|
+| 通道正在运行（`/weixin start`） | 通道未启动时不掷骰，不消耗次数 |
+| 目标有 `context_token` | 返回 `no-context-token`，等下一轮 |
+| 该用户的 Agent 处于 `idle` | 用户正在对话时不插嘴，等下一轮 |
+
+### 手动验证
+
+设置页「立即发一条」按钮（或 `POST /api/dsh-weixin/autosend/trigger`）
+跳过骰子直接发一条，用来确认链路通了——否则配好之后可能要等好几个基础间隔才命中一次。
 
 ## 配置
 
@@ -234,7 +302,18 @@ UI 设置存放在 `$DSH_HOME/storages/dsh-weixin/settings.json`，
 | `session.cwd` | `""` | 是 | 会话工作目录，空=DSH 默认（改后需重启） |
 | `session.idPrefix` | `weixin` | — | 会话 ID 前缀，避免与 Web UI 冲突 |
 | `session.agentPreset` | `""` | — | Agent 预设 ID，空=用 DSH 默认预设。**留空时仍会自动取默认预设，否则 Agent 没有工具** |
-| `channel.botAgent` | `dsh-weixin/0.1.1` | — | 写入 `base_info.bot_agent` |
+| `channel.botAgent` | `dsh-weixin/0.2.0` | — | 写入 `base_info.bot_agent` |
+| `autoSend.enabled` | `false` | 是 | 自动发送总开关 |
+| `autoSend.startTime` | `09:00` | 是 | 时间段起点（含），`HH:MM` |
+| `autoSend.endTime` | `23:00` | 是 | 时间段终点（不含），支持跨零点 |
+| `autoSend.baseIntervalMin` | `30` | 是 | 基础节奏间隔（分钟），即每隔多久掷一次骰子 |
+| `autoSend.activeIntervalMin` | `5` | 是 | 命中发出后的活跃节奏间隔（分钟） |
+| `autoSend.hitRate` | `0.2` | 是 | 单次掷骰命中概率（0–1），界面按百分数显示 |
+| `autoSend.maxStreak` | `5` | 是 | 连续命中上限，达到后强制冷却 |
+| `autoSend.cooldownMin` | `120` | 是 | 冷却时长（分钟） |
+| `autoSend.targets` | `[]` | 是 | 接收者 userId 列表，空=最近互动过的用户 |
+| `autoSend.maxChars` | `120` | 是 | 单条自动消息最大字符数，超出截断 |
+| `autoSend.instruction` | `""` | 是 | 生成指令，空=内置默认 |
 
 ## 数据位置
 
@@ -242,6 +321,7 @@ UI 设置存放在 `$DSH_HOME/storages/dsh-weixin/settings.json`，
 
 ```
 ~/.dsh/storages/dsh-weixin/settings.json            # UI 设置（可删，删后回默认）
+~/.dsh/storages/dsh-weixin/autosend-state.json      # 自动发送调度状态（可删，删后重新排程）
 ~/.dsh/storages/dsh-weixin/accounts/index.json      # 账号索引
 ~/.dsh/storages/dsh-weixin/accounts/<id>.json       # 账号凭据
 ~/.dsh/storages/dsh-weixin/accounts/<id>.context-tokens.json
@@ -264,6 +344,7 @@ L5 Web UI   侧栏图标 / 设置页 / 登录卡片        lib/client.js（浏�
 L4 运维     扫码登录 / 账号存储 / 配置 / 命令    src/auth, src/commands, src/config-store
 ───────────────── HTTP /api/dsh-weixin/* ─────────────────
 L3 桥接     入站 轮询→agent.followup ；出站 agent 事件→sendMessage
+            自动发送 骰子调度→agent.followup（复用出站链路）  src/auto-send
 L2 适配     替换 openclaw/plugin-sdk 的 11 处依赖
 L1 协议     getUpdates / sendMessage / CDN / AES / 长轮询退避
 ```
@@ -296,6 +377,16 @@ L1 协议     getUpdates / sendMessage / CDN / AES / 长轮询退避
   `~standard.validate` 兜底，而不是顶层 `import` 直接崩（GitHub 安装版曾缺此包）
 - 改 `lib/client.js` **无需重启 Host**：bundle 的 rev 由文件 mtime/size 算出
 
+### 测试
+
+```bash
+npm test
+```
+
+用例不依赖 DSH 运行时：时间窗与掷骰决策是纯函数，调度器注入假时钟与随机源，
+出站截断用假 bridge 直接调真实方法。覆盖跨零点窗口、冷却边界、重启恢复、
+busy 唤醒不丢失、以及自动发送标记只作用于本回合（避免误截断用户回复）。
+
 ## 源码地图
 
 | 文件 | 职责 |
@@ -309,10 +400,12 @@ L1 协议     getUpdates / sendMessage / CDN / AES / 长轮询退避
 | `src/auth/login-qr.js` | 扫码登录状态机（支持 Web 注入验证码） |
 | `src/bridge/context-tokens.js` | contextToken 持久化 |
 | `src/channel/channel.js` | 通道运行时与状态汇总 |
+| `src/auto-send/*` | 自动发送：时间窗、双节奏调度、状态持久化、目标解析 |
 | `src/commands/weixin-command.js` | `/weixin` 命令 |
-| `src/web/routes.js` | Web UI 数据面，10 个 HTTP 端点 |
+| `src/web/routes.js` | Web UI 数据面，11 个 HTTP 端点 |
 | `lib/client.js` | 浏览器端插件：侧栏图标 + 设置页（自包含单文件） |
 | `src/util/*` | 路径、日志、脱敏、格式化 |
+| `test/*` | `node --test` 用例：时间窗、调度状态机、出站截断作用域 |
 
 ### HTTP 端点
 
@@ -328,6 +421,7 @@ L1 协议     getUpdates / sendMessage / CDN / AES / 长轮询退避
 | POST | `/api/dsh-weixin/accounts/remove` | 删除账号 |
 | POST | `/api/dsh-weixin/start` | 启动通道 |
 | POST | `/api/dsh-weixin/stop` | 停止通道 |
+| POST | `/api/dsh-weixin/autosend/trigger` | 跳过骰子立即发一条（验证链路用） |
 
 ## 已知限制
 
@@ -341,6 +435,8 @@ L1 协议     getUpdates / sendMessage / CDN / AES / 长轮询退避
 - `replyProgressMessages`（工具调用进度作为中间消息）尚未真正实现。
 - iLink 协议为非公开接口，需跟随上游包更新。
 - `enabled` 与 `session.cwd` 改动需重启才完全生效（两者只在启动路径上读取）。
+- 自动发送的逻辑层有 `npm test` 覆盖，但**尚未在真实微信环境跑通端到端**——
+  需要运行中的 DSH 与已登录账号才能验证实际出站。
 - 界面只覆盖常用项；`session.idPrefix`、`channel.botAgent` 等仍需编辑配置文件。
 
 ## 许可

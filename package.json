@@ -1,6 +1,6 @@
 {
   "name": "dsh-weixin",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "DeepSeek Harness 微信通道插件：iLink Bot 长轮询收发，接入 DSH Agent 会话",
   "type": "module",
   "main": "src/index.js",
@@ -18,6 +18,9 @@
   "engines": {
     "node": ">=22.13.0",
     "dsh": ">=0.2.0-rc.2"
+  },
+  "scripts": {
+    "test": "node --test"
   },
   "dsh": {
     "manifestVersion": 1,
@@ -43,10 +46,18 @@
     "@deepseek-ai/dsh-workspace": ">=0.2.0-rc.2"
   },
   "peerDependenciesMeta": {
-    "@deepseek-ai/dsh-agent": { "optional": true },
-    "@deepseek-ai/dsh-llm": { "optional": true },
-    "@deepseek-ai/dsh-session": { "optional": true },
-    "@deepseek-ai/dsh-workspace": { "optional": true }
+    "@deepseek-ai/dsh-agent": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-llm": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-session": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-workspace": {
+      "optional": true
+    }
   },
   "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.5",

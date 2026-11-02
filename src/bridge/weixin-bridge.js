@@ -32,11 +32,21 @@ import {
 import { StreamWriter, extractChunkText } from "./stream-outbound.js";
 import { resolveStoreDir } from "../util/paths.js";
 import { logger } from "../util/logger.js";
+import { buildAutoSendPrompt } from "../auto-send/prompt.js";
 
 /** 微信单条文本上限（服务端硬限制，超出会被截断）。 */
 const WECHAT_TEXT_LIMIT = 4000;
 /** "正在输入" 状态的刷新间隔（微信侧约 5s 失效）。 */
 const TYPING_REFRESH_MS = 4_000;
+
+/**
+ * 自动发送标记的存活时间。
+ *
+ * 正常回合几十秒内就会产生 `turn-stopping` 把标记消费掉；
+ * 超过这个时间说明回合没跑起来（Agent 报错、模型超时），
+ * 必须主动清理，否则标记会污染后续正常回复的截断逻辑。
+ */
+const AUTO_SEND_MARK_TTL_MS = 120_000;
 /**
  * 相邻出站消息的最小间隔。
  *
@@ -258,6 +268,18 @@ export class WeixinBridge {
      */
     this.promptGen = 0;
 
+    /**
+     * @type {Map<string, {maxChars: number, phase: string, timer: any}>}
+     * sessionId → 本回合是"自动发送"的标记。
+     *
+     * 出站收尾时凭它做两件事：把回复压成单行并截到 `maxChars`
+     * （冒泡不该是一屏长文），以及跳过流式增量下发
+     * （流式是边生成边发，来不及截断，会漏出半截长文）。
+     *
+     * 只在**本回合**内有效：`flushReply` 消费后立即删除。
+     */
+    this.autoSendMarks = new Map();
+
     // 流式出站：只有 mode=stream 时才建，final 模式走整段发送
     this.streamWriter = cfg.outbound?.mode === "stream"
       ? new StreamWriter({
@@ -333,6 +355,151 @@ export class WeixinBridge {
 
     agent.followup(message);
     logger.info(`bridge: followup queued session=${sessionId} agentStatus=${agent.status}`);
+  }
+
+  /**
+   * 触发一次「自动发送」：让 Agent 主动生成一条消息发出去。
+   *
+   * 与 `handleInbound` 的区别只在"谁来开口"：
+   *   - 入站是用户说了一句，这里没有人说话，由调度器掷骰决定；
+   *   - 出站链路完全复用——`followup` 之后照样走
+   *     `agent/turn-stopping` → `flushReply` → `sendText`。
+   *
+   * 三个前置条件缺一不可，任一不满足都返回 `ok:false` 让调度器顺延：
+   *   1. 通道在运行（轮询没起就没有账号上下文）；
+   *   2. 目标用户有 `context_token`（微信要求回复必须带回，没它发不出去）；
+   *   3. Agent 处于 `idle`（正在处理用户消息时插一条会把两轮搅在一起）。
+   *
+   * @param {object} params - 参数
+   * @param {string} params.accountId - 账号 ID
+   * @param {string} params.fromUserId - 目标微信用户
+   * @param {number} [params.maxChars] - 本回合回复的字数上限
+   * @param {string} [params.instruction] - 附加指令
+   * @param {string} [params.phase] - 当前节奏（`base` / `active`）
+   * @returns {Promise<{ok: boolean, reason?: string, target?: object}>} 结果
+   */
+  async triggerAutoSend({ accountId, fromUserId, maxChars, instruction, phase }) {
+    if (!this.channel.running) {
+      return { ok: false, reason: "channel-not-running" };
+    }
+    if (!fromUserId) {
+      return { ok: false, reason: "no-target" };
+    }
+
+    const accounts = this.channel.listAccounts();
+    const account =
+      (accountId ? accounts.find((a) => a.accountId === accountId && a.token) : null)
+      ?? this.channel.getAccountForSender(fromUserId);
+    if (!account) {
+      return { ok: false, reason: "no-account" };
+    }
+
+    // 没有 context_token 就一定发不出去，提前拒绝比发出去再失败干净。
+    const contextToken =
+      this.channel.getContextToken(fromUserId) ?? getContextToken(account.accountId, fromUserId);
+    if (!contextToken) {
+      return { ok: false, reason: "no-context-token" };
+    }
+
+    const sessionId = resolveSessionId(this.cfg, account.accountId, fromUserId, this.promptGen);
+    const agent = await this.ensureAgent(sessionId, account.accountId, fromUserId);
+
+    if (agent.status !== "idle") {
+      return { ok: false, reason: `agent-${agent.status}` };
+    }
+    if (this.autoSendMarks.has(sessionId)) {
+      return { ok: false, reason: "already-pending" };
+    }
+
+    this.replyTargets.set(sessionId, fromUserId);
+    // 这一轮的 runId 同时写进标记：标记只按会话存，会话里随时可能混进
+    // 用户自己的消息，靠 runId 才能判定"这个标记属于哪一轮"。
+    const runId = randomUUID();
+    this.runIds.set(sessionId, runId);
+
+    const limit = Math.max(10, Number(maxChars) || 120);
+    const mark = { maxChars: limit, phase: phase ?? "base", runId, timer: null };
+    // 兜底清理：Agent 崩溃时不会产生 `turn-stopping`，标记不删会让
+    // 之后**正常**的回复也被当成自动发送而截断。
+    mark.timer = setTimeout(() => {
+      if (this.autoSendMarks.get(sessionId) === mark) {
+        this.autoSendMarks.delete(sessionId);
+        logger.warn(`bridge: autosend mark expired session=${sessionId}`);
+      }
+    }, AUTO_SEND_MARK_TTL_MS);
+    mark.timer.unref?.();
+    this.autoSendMarks.set(sessionId, mark);
+
+    if (this.cfg.typingIndicator !== false) {
+      this.startTyping(account.accountId, fromUserId);
+    }
+
+    const text = buildAutoSendPrompt({ instruction, maxChars: limit, phase });
+    agent.followup(
+      createUserMessage({
+        content: [{ type: "text", text }],
+        // 自定义 kind：会话日志里能和真实用户消息区分开，
+        // 排查"这句是谁说的"时不用靠文本内容猜。
+        source: {
+          kind: "weixin-autosend",
+          accountId: account.accountId,
+          fromUserId,
+          sessionId,
+        },
+      }),
+    );
+
+    logger.info(
+      `bridge: autosend queued session=${sessionId} to=${fromUserId} limit=${limit} phase=${mark.phase}`,
+    );
+    return { ok: true, target: { accountId: account.accountId, userId: fromUserId } };
+  }
+
+  /**
+   * 取属于**本回合**的自动发送标记。
+   *
+   * 标记以会话为键存放，而同一会话里紧接着就可能收到用户自己的消息。
+   * 若只判断"有没有标记"，一次没有产出文本的自动发送（Agent 报错、回复为空）
+   * 会让标记残留到 TTL 到期，期间用户的正常回复会被误当成冒泡处理：
+   * 压成单行、截到 `maxChars`，流式也被跳过。
+   *
+   * 因此用 `runId` 对齐。每轮发送（入站与自动）都会刷新 `runIds`，
+   * 只有标记记录的 runId 与当前一致，才说明这一轮确实是自动发送。
+   * 不一致时**不动标记**，交回 TTL 兜底清理——宁可漏一次截断，
+   * 也不能改坏用户正在看的回复。
+   *
+   * @param {string} sessionId - 会话 ID
+   * @returns {object|null} 本回合的标记；不属于本回合返回 null
+   */
+  autoSendMarkFor(sessionId) {
+    const mark = this.autoSendMarks.get(sessionId);
+    if (!mark) return null;
+    if (mark.runId !== this.runIds.get(sessionId)) return null;
+    return mark;
+  }
+
+  /**
+   * 消费自动发送标记，并按要求把回复压成单行短句。
+   *
+   * 只在该标记属于本回合时生效，判定见 `autoSendMarkFor`。
+   *
+   * @param {string} sessionId - 会话 ID
+   * @param {string} text - 原始回复
+   * @returns {string} 处理后的文本（不适用时原样返回）
+   */
+  consumeAutoSendCap(sessionId, text) {
+    const mark = this.autoSendMarkFor(sessionId);
+    if (!mark) return text;
+
+    this.autoSendMarks.delete(sessionId);
+    if (mark.timer) clearTimeout(mark.timer);
+
+    // 换行压成空格：自动发送走的是单条气泡，多行会显得像模板消息。
+    const flat = String(text).replace(/\s*\n+\s*/g, " ").trim();
+    if (flat.length <= mark.maxChars) return flat;
+    logger.info(`bridge: autosend reply truncated ${flat.length} → ${mark.maxChars}`);
+    // 省略号占一位，保证最终长度仍在 `maxChars` 之内。
+    return `${flat.slice(0, Math.max(1, mark.maxChars - 1))}…`;
   }
 
   /**
@@ -756,6 +923,11 @@ export class WeixinBridge {
     // 流式增量：mode=stream 时把 chunk 攒成段陆续发，营造"边想边说"
     if (this.streamWriter) {
       agent.ctx.on("agent/assistant-stream", (payload) => {
+        // 自动发送必须走整段出站：流式是边生成边下发，等拿到全文时
+        // 前半截已经发出去了，`maxChars` 截断就形同虚设。
+        // 用 `autoSendMarkFor` 而非 `has`：残留标记不能连累用户自己的回合。
+        if (this.autoSendMarkFor(sessionId)) return;
+
         const frame = payload?.frame;
         if (frame?.type !== "chunk") return;
 
@@ -898,11 +1070,15 @@ export class WeixinBridge {
       return;
     }
 
-    const text = this.extractAssistantText(agent, turn);
-    if (!text) {
+    const rawText = this.extractAssistantText(agent, turn);
+    if (!rawText) {
       logger.debug(`bridge: session=${sessionId} produced no assistant text, skip`);
       return;
     }
+
+    // 自动发送的回合要压成单行短句，见 `consumeAutoSendCap`。
+    const text = this.consumeAutoSendCap(sessionId, rawText);
+    if (!text) return;
 
     const parts = chunkText(text, this.cfg.outbound?.textChunkLimit ?? WECHAT_TEXT_LIMIT);
     for (let i = 0; i < parts.length; i += 1) {
@@ -1491,6 +1667,11 @@ export class WeixinBridge {
     this.streamStats.clear();
     this.typingTickets.clear();
     this.failedParts.clear();
+    // 自动发送标记自带定时器，必须逐个清掉，否则 stop 之后定时器仍在跑。
+    for (const mark of this.autoSendMarks.values()) {
+      if (mark?.timer) clearTimeout(mark.timer);
+    }
+    this.autoSendMarks.clear();
     this.runIds.clear();
 
     for (const handle of handles) {

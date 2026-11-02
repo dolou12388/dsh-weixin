@@ -39,6 +39,14 @@ export class WeixinChannel {
     this.contextTokens = new Map();
     /** @type {Map<string, string>} fromUserId → accountId（反查用哪个账号回复） */
     this.senderAccounts = new Map();
+    /**
+     * @type {Map<string, {accountId: string, at: number}>} fromUserId → 最近一次入站时间
+     *
+     * 自动发送需要一个"发给谁"的答案。配置里留空时按这里挑最近互动过的人，
+     * 因为主动冒泡发给刚聊过的人最自然，也几乎一定有可用的 context_token。
+     * 只存内存：重启后靠状态文件里的 `lastTarget` 兜底。
+     */
+    this.lastInboundAt = new Map();
     /** @type {Promise<void>[]} 轮询任务 */
     this.pollTasks = [];
   }
@@ -102,6 +110,19 @@ export class WeixinChannel {
     }
     const all = this.listAccounts();
     return all[0] ?? null;
+  }
+
+  /**
+   * 取最近一次入站的发送者。
+   *
+   * @returns {{userId: string, accountId: string, at: number}|null} 最近互动信息
+   */
+  getRecentInbound() {
+    let best = null;
+    for (const [userId, info] of this.lastInboundAt) {
+      if (!best || info.at > best.at) best = { userId, accountId: info.accountId, at: info.at };
+    }
+    return best;
   }
 
   /**
@@ -189,6 +210,8 @@ export class WeixinChannel {
           const fromUserId = msg.from_user_id;
           // 记录来源账号，出站时用同一账号回复
           this.senderAccounts.set(fromUserId, accountId);
+          // 供自动发送挑选"最近互动过的人"
+          this.lastInboundAt.set(fromUserId, { accountId, at: Date.now() });
           await this.bridge.handleInbound({
             accountId,
             text,
@@ -249,6 +272,7 @@ export class WeixinChannel {
     }
     this.contextTokens.clear();
     this.senderAccounts.clear();
+    this.lastInboundAt.clear();
 
     logger.info("channel.stop: stopped");
   }
